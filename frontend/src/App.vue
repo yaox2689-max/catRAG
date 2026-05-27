@@ -66,16 +66,33 @@
                     <div class="upload-area">
                         <input 
                             type="file" 
-                            ref="fileInput" 
+                            ref="settingsFileInput" 
                             @change="handleFileSelect"
                             accept=".pdf,.doc,.docx,.xls,.xlsx"
                             style="display: none"
                         />
-                        <button @click="$refs.fileInput.click()" class="upload-btn">
+                        <button @click="$refs.settingsFileInput.click()" class="upload-btn">
                             <i class="fas fa-cloud-upload-alt"></i> 选择文件
                         </button>
                         <div v-if="selectedFile" class="selected-file">
-                            <i class="fas fa-file"></i> {{ selectedFile.name }}
+                            <div class="selected-file-preview">
+                                <div
+                                    class="selected-file-icon"
+                                    :class="'file-type-' + getFileExtension(selectedFile.name).toLowerCase()"
+                                >
+                                    <i :class="getAttachmentFileIcon(selectedFile.name)"></i>
+                                </div>
+                                <div class="selected-file-info">
+                                    <div class="selected-file-name">{{ getAttachmentBaseName(selectedFile.name) }}</div>
+                                    <div class="selected-file-meta">
+                                        <span class="file-ext-badge">.{{ getFileExtension(selectedFile.name).toLowerCase() }}</span>
+                                        <span>{{ formatFileSize(selectedFile.size) }}</span>
+                                    </div>
+                                </div>
+                                <button type="button" class="selected-file-remove" @click="clearSelectedFile" title="移除文件">
+                                    <i class="fas fa-times"></i>
+                                </button>
+                            </div>
                             <button @click="uploadDocument" class="btn-primary" :disabled="isUploading">
                                 <i class="fas fa-upload"></i> {{ isUploading ? '上传中...' : '开始上传' }}
                             </button>
@@ -112,19 +129,19 @@
                     <button @click="loadDocuments" class="btn-secondary">
                         <i class="fas fa-sync"></i> 刷新列表
                     </button>
-                    
+
                     <div v-if="documentsLoading" class="loading-indicator">
                         加载中...
                     </div>
-                    
+
                     <div v-else-if="documents.length === 0" class="empty-documents">
                         <i class="fas fa-inbox"></i>
                         <p>暂无文档</p>
                     </div>
-                    
+
                     <div v-else class="documents-list">
-                        <div 
-                            v-for="doc in documents" 
+                        <div
+                            v-for="doc in documents"
                             :key="doc.filename"
                             class="document-item"
                             :class="{ deleting: deleteJobs[doc.filename]?.status === 'running' }"
@@ -143,8 +160,8 @@
                                             </div>
                                         </div>
                                     </div>
-                                    <button 
-                                        @click="deleteDocument(doc.filename)" 
+                                    <button
+                                        @click="deleteDocument(doc.filename)"
                                         class="btn-danger"
                                         title="删除文档"
                                         :disabled="isDeleteActionLocked(doc.filename)"
@@ -392,12 +409,57 @@
                     </div>
                 </div>
                 
+
                 <!-- Loading Indicator -->
             </div>
 
             <div class="input-area-wrapper">
+                <div v-if="chatAttachments && chatAttachments.length" class="chat-attachment-strip">
+                    <div
+                        v-for="item in chatAttachments"
+                        :key="item.id"
+                        class="chat-attachment-card"
+                        :class="[`chat-attachment-${item.kind}`, `chat-attachment-${item.status || 'ready'}`]"
+                    >
+                        <div
+                            v-if="item.kind === 'image'"
+                            class="chat-attachment-thumb"
+                            @click="openAttachment(item)"
+                        >
+                            <img :src="item.previewUrl" :alt="item.name" class="chat-attachment-image" />
+                        </div>
+                        <div
+                            v-else
+                            class="chat-attachment-file-icon"
+                            :class="'file-type-' + (item.extension || getFileExtension(item.name)).toLowerCase()"
+                        >
+                            <i :class="getAttachmentFileIcon(item.name)"></i>
+                        </div>
+                        <div class="chat-attachment-info" @click="openAttachment(item)">
+                            <div class="chat-attachment-name" :title="item.name">{{ getAttachmentBaseName(item.name) }}</div>
+                            <div class="chat-attachment-meta">
+                                <span v-if="item.kind === 'file'" class="file-ext-badge">.{{ (item.extension || getFileExtension(item.name)).toLowerCase() }}</span>
+                                <span v-if="item.size">{{ formatFileSize(item.size) }}</span>
+                                <span v-if="item.kind === 'image'" class="chat-attachment-status">{{ getImageStatusLabel(item) }}</span>
+                            </div>
+                        </div>
+                        <button type="button" class="chat-attachment-remove" @click.stop="removeAttachment(item.id)" title="移除">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </div>
                 <div class="input-area">
-                    <button class="attach-btn"><i class="fas fa-paperclip"></i></button>
+                    <button class="attach-btn" type="button" @click="toggleAttachMenu"><i class="fas fa-paperclip"></i></button>
+                    <div v-if="showAttachMenu" class="attach-menu">
+                        <button type="button" class="attach-menu-item" @click="handleChatAttachClick('document')">
+                            <i class="fas fa-file"></i> 上传文件
+                        </button>
+                        <button type="button" class="attach-menu-item" @click="handleChatAttachClick('image')">
+                            <i class="fas fa-image"></i> 上传图片
+                        </button>
+                    </div>
+                    <input type="file" ref="chatFileInput" @change="handleChatDocumentSelect" accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.md" style="display: none" />
+                    <input type="file" ref="chatImageInput" @change="handleChatImageSelect" accept="image/*" style="display: none" />
                     <textarea 
                         v-model="userInput" 
                         @keydown="handleKeyDown"
@@ -420,6 +482,19 @@
             </div>
             <!-- End of Chat Area -->
         </main>
+
+        <div v-if="showImagePreview && previewImageUrl" class="image-preview-overlay" @click.self="closeImagePreview">
+            <div class="image-preview-dialog">
+                <button type="button" class="image-preview-close" @click="closeImagePreview" title="关闭">
+                    <i class="fas fa-times"></i>
+                </button>
+                <img :src="previewImageUrl" :alt="previewImageName" class="image-preview-full" />
+                <div class="image-preview-footer">
+                    <div class="image-preview-name">{{ previewImageName }}</div>
+                    <div v-if="previewOcrMessage" class="image-preview-status">{{ previewOcrMessage }}</div>
+                </div>
+            </div>
+        </div>
     </div>
 </template>
 

@@ -42,6 +42,7 @@ from schemas import (
     DocumentUploadResponse,
     DocumentUploadStartResponse,
     LoginRequest,
+    OCRUploadResponse,
     MessageInfo,
     RegisterRequest,
     SessionDeleteResponse,
@@ -51,6 +52,9 @@ from schemas import (
 )
 print("[api] 加载 upload_jobs …", flush=True)
 from upload_jobs import DELETE_STEPS, delete_job_manager, upload_job_manager
+
+print("[api] 加载 OCR 服务 …", flush=True)
+from ocr_service import is_supported_image, recognize_image_bytes
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR.parent / "data"
@@ -84,6 +88,22 @@ def _remove_bm25_stats_for_filename(filename: str) -> None:
     )
     texts = [r.get("text") or "" for r in rows]
     embedding_service.increment_remove_documents(texts)
+
+
+def _delete_local_uploaded_file(filename: str) -> None:
+    """删除 data/documents 下对应的本地文件，包含 OCR 子目录。"""
+    candidates = [UPLOAD_DIR / filename, UPLOAD_DIR / "ocr" / filename]
+    for path in candidates:
+        try:
+            if path.exists() and path.is_file():
+                path.unlink()
+        except Exception:
+            pass
+
+
+def _delete_mysql_document_data(filename: str) -> int:
+    """删除 MySQL/PostgreSQL 中与文档相关的父级分块数据。"""
+    return parent_chunk_store.delete_by_filename(filename)
 
 
 @router.post("/auth/register", response_model=AuthResponse)
@@ -167,7 +187,14 @@ async def delete_session(session_id: str, current_user: User = Depends(get_curre
 async def chat_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user)):
     try:
         session_id = request.session_id or "default_session"
-        resp = chat_with_agent(request.message, current_user.username, session_id)
+        resp = chat_with_agent(
+            request.message,
+            current_user.username,
+            session_id,
+            image_context=request.image_context or "",
+            file_name=request.file_name or "",
+            file_content_b64=request.file_content_b64 or "",
+        )
         if isinstance(resp, dict):
             return ChatResponse(**resp)
         return ChatResponse(response=resp)
@@ -197,7 +224,14 @@ async def chat_stream_endpoint(request: ChatRequest, current_user: User = Depend
     async def event_generator():
         try:
             session_id = request.session_id or "default_session"
-            async for chunk in chat_with_agent_stream(request.message, current_user.username, session_id):
+            async for chunk in chat_with_agent_stream(
+                request.message,
+                current_user.username,
+                session_id,
+                image_context=request.image_context or "",
+                file_name=request.file_name or "",
+                file_content_b64=request.file_content_b64 or "",
+            ):
                 yield chunk
         except Exception as e:
             error_data = {"type": "error", "content": str(e)}
@@ -223,6 +257,11 @@ def _is_supported_document(filename: str) -> bool:
     )
 
 
+def _is_supported_image(filename: str) -> bool:
+    file_lower = filename.lower()
+    return file_lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"))
+
+
 async def _save_upload_file(file: UploadFile, file_path: Path) -> None:
     """按块写入上传文件，避免大文件一次性读入内存。"""
     with open(file_path, "wb") as f:
@@ -231,6 +270,13 @@ async def _save_upload_file(file: UploadFile, file_path: Path) -> None:
             if not chunk:
                 break
             f.write(chunk)
+
+
+def _extract_image_ocr_text(file_path: str, filename: str) -> str:
+    """OCR 占位接口：在这里接入你的 OCR 引擎。"""
+    # TODO: 在这里接入 OCR（例如 PaddleOCR / EasyOCR / Tesseract / 云 OCR 服务）
+    # 返回识别到的纯文本；识别失败时返回空字符串或抛出异常均可。
+    raise NotImplementedError("OCR 尚未接入，请在 _extract_image_ocr_text 中实现")
 
 
 def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
@@ -252,7 +298,7 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
         except Exception:
             pass
         try:
-            parent_chunk_store.delete_by_filename(filename)
+            _delete_mysql_document_data(filename)
         except Exception:
             pass
         upload_job_manager.complete_step(job_id, "cleanup", "旧版本清理完成")
@@ -332,8 +378,14 @@ def _process_delete_job(job_id: str, filename: str) -> None:
 
         failed_step = "parent_store"
         delete_job_manager.update_step(job_id, "parent_store", 30, "running", "正在删除 PostgreSQL 父级分块")
-        parent_chunk_store.delete_by_filename(filename)
+        _delete_mysql_document_data(filename)
         delete_job_manager.complete_step(job_id, "parent_store", "父级分块已删除")
+
+        # 删除本地物理文件
+        failed_step = "file_cleanup"
+        delete_job_manager.update_step(job_id, "file_cleanup", 20, "running", "正在删除本地文件")
+        _delete_local_uploaded_file(filename)
+        delete_job_manager.complete_step(job_id, "file_cleanup", "本地文件已删除")
 
         # 完成摘要会由前端保留 3 秒，再自动从文档列表移除。
         delete_job_manager.complete_job(job_id, f"已删除 {filename}，向量数据 {deleted_count} 条")
@@ -341,30 +393,104 @@ def _process_delete_job(job_id: str, filename: str) -> None:
         delete_job_manager.fail_job(job_id, failed_step, str(e))
 
 
+def _persist_image_ocr_document(filename: str, text: str, file_path: str) -> int:
+    """将图片 OCR 文本按文档分块并写入 PostgreSQL / Milvus。"""
+    cleaned_text = (text or "").strip() or f"[图片OCR未识别到文本] 文件名：{filename}"
+
+    milvus_manager.init_collection()
+    try:
+        _remove_bm25_stats_for_filename(filename)
+    except Exception:
+        pass
+    try:
+        milvus_manager.delete(f'filename == "{filename}"')
+    except Exception:
+        pass
+    try:
+        parent_chunk_store.delete_by_filename(filename)
+    except Exception:
+        pass
+
+    base_doc = {
+        "filename": filename,
+        "file_path": file_path,
+        "file_type": "Image",
+        "page_number": 0,
+    }
+    chunks = _get_document_loader()._split_page_to_three_levels(cleaned_text, base_doc, 0)
+    parent_docs = [doc for doc in chunks if int(doc.get("chunk_level", 0) or 0) in (1, 2)]
+    leaf_docs = [doc for doc in chunks if int(doc.get("chunk_level", 0) or 0) == 3]
+    if not leaf_docs:
+        raise ValueError("OCR 文本过短，未生成可检索分块")
+
+    parent_chunk_store.upsert_documents(parent_docs)
+    milvus_writer.write_documents(leaf_docs)
+    return len(leaf_docs)
+
+
 @router.get("/documents", response_model=DocumentListResponse)
 async def list_documents(_: User = Depends(require_admin)):
-    """获取已上传的文档列表（管理员）"""
+    """获取 data/documents 下的文件清单，并显示每个文件的三级子块数量。"""
     try:
-        milvus_manager.init_collection()
+        # 1) 以 data/documents 实际文件为准（包含 ocr 子目录）
+        supported_suffixes = {
+            ".pdf": "PDF",
+            ".doc": "Word",
+            ".docx": "Word",
+            ".xls": "Excel",
+            ".xlsx": "Excel",
+            ".png": "Image",
+            ".jpg": "Image",
+            ".jpeg": "Image",
+            ".bmp": "Image",
+            ".gif": "Image",
+            ".webp": "Image",
+            ".tif": "Image",
+            ".tiff": "Image",
+        }
 
-        results = milvus_manager.query(
-            output_fields=["filename", "file_type"],
-            limit=10000,
-        )
+        filenames: dict[str, str] = {}
+        if UPLOAD_DIR.exists():
+            for p in UPLOAD_DIR.rglob("*"):
+                if not p.is_file():
+                    continue
+                ext = p.suffix.lower()
+                if ext not in supported_suffixes:
+                    continue
+                filenames[p.name] = supported_suffixes[ext]
 
-        file_stats = {}
-        for item in results:
-            filename = item.get("filename", "")
-            file_type = item.get("file_type", "")
-            if filename not in file_stats:
-                file_stats[filename] = {
-                    "filename": filename,
-                    "file_type": file_type,
-                    "chunk_count": 0,
-                }
-            file_stats[filename]["chunk_count"] += 1
+        # 2) 从 Milvus 统计每个文件的三级子块数量（chunk_level == 3）
+        leaf_counts: dict[str, int] = {}
+        milvus_types: dict[str, str] = {}
+        try:
+            milvus_manager.init_collection()
+            leaf_rows = milvus_manager.query_all(
+                filter_expr="chunk_level == 3",
+                output_fields=["filename", "file_type"],
+            )
+            for row in leaf_rows:
+                name = row.get("filename") or ""
+                if not name:
+                    continue
+                leaf_counts[name] = leaf_counts.get(name, 0) + 1
+                if name not in milvus_types:
+                    milvus_types[name] = row.get("file_type") or ""
+        except Exception as milvus_err:
+            print(f"[list_documents] Milvus 不可用，仅展示本地文件: {milvus_err}", flush=True)
 
-        documents = [DocumentInfo(**stats) for stats in file_stats.values()]
+        # 3) 合并：展示 data/documents 中的文件；若 Milvus 有孤儿数据也补充展示
+        all_names = set(filenames.keys()) | set(leaf_counts.keys())
+        documents: list[DocumentInfo] = []
+        for name in sorted(all_names):
+            file_type = filenames.get(name) or milvus_types.get(name) or "Unknown"
+            documents.append(
+                DocumentInfo(
+                    filename=name,
+                    file_type=file_type,
+                    chunk_count=leaf_counts.get(name, 0),
+                )
+            )
+
         return DocumentListResponse(documents=documents)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取文档列表失败: {str(e)}")
@@ -429,7 +555,7 @@ async def delete_document_async(
         steps=DELETE_STEPS,
         current_step="prepare",
         message="等待删除",
-        completion_step="parent_store",
+        completion_step="file_cleanup",
     )
     delete_job_manager.update_step(job["job_id"], "prepare", 1, "running", "删除任务已提交")
     background_tasks.add_task(_process_delete_job, job["job_id"], filename)
@@ -446,6 +572,76 @@ async def get_delete_job(job_id: str, _: User = Depends(require_admin)):
     if not job:
         raise HTTPException(status_code=404, detail="删除任务不存在或已过期")
     return DocumentDeleteJobResponse(**job)
+
+
+@router.post("/ocr/upload", response_model=OCRUploadResponse)
+async def ocr_upload(file: UploadFile = File(...), _: User = Depends(get_current_user)):
+    filename = file.filename or ""
+    if not filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+    if not is_supported_image(filename):
+        raise HTTPException(status_code=400, detail="仅支持图片文件：png/jpg/jpeg/bmp/gif/webp")
+
+    try:
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="图片内容不能为空")
+        result = recognize_image_bytes(image_bytes, filename=filename)
+        text = (result.get("text") or "").strip()
+        provider = result.get("provider") or "ocr"
+        message = "OCR 识别成功" if text else f"OCR 已上传，当前未识别到文本（{provider}）"
+        return OCRUploadResponse(
+            filename=filename,
+            text=text,
+            provider=provider,
+            message=message,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OCR 识别失败: {str(e)}")
+
+
+@router.post("/ocr/upload/admin", response_model=OCRUploadResponse)
+async def ocr_upload_admin(file: UploadFile = File(...), _: User = Depends(require_admin)):
+    filename = file.filename or ""
+    if not filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+    if not is_supported_image(filename):
+        raise HTTPException(status_code=400, detail="仅支持图片文件：png/jpg/jpeg/bmp/gif/webp")
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    image_dir = UPLOAD_DIR / "ocr"
+    os.makedirs(image_dir, exist_ok=True)
+    file_path = image_dir / filename
+
+    try:
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="图片内容不能为空")
+        with open(file_path, "wb") as f:
+            f.write(image_bytes)
+        result = recognize_image_bytes(image_bytes, filename=filename)
+        text = (result.get("text") or "").strip()
+        provider = result.get("provider") or "ocr"
+        if text:
+            try:
+                chunks_processed = _persist_image_ocr_document(filename, text, str(file_path))
+                message = f"OCR 识别成功，已切割并入库 {chunks_processed} 个叶子分块"
+            except Exception as persist_err:
+                raise HTTPException(status_code=500, detail=f"OCR 文本入库失败: {persist_err}")
+        else:
+            message = f"OCR 已上传，当前未识别到文本（{provider}）"
+        return OCRUploadResponse(
+            filename=filename,
+            text=text,
+            provider=provider,
+            message=message,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OCR 识别失败: {str(e)}")
 
 
 @router.post("/documents/upload", response_model=DocumentUploadResponse)
@@ -517,19 +713,20 @@ async def upload_document(file: UploadFile = File(...), _: User = Depends(requir
 
 @router.delete("/documents/{filename}", response_model=DocumentDeleteResponse)
 async def delete_document(filename: str, _: User = Depends(require_admin)):
-    """删除文档在 Milvus 中的向量（保留本地文件，管理员）"""
+    """删除文档在 Milvus 中的向量，并删除 data/documents 下的本地文件。"""
     try:
         milvus_manager.init_collection()
 
         delete_expr = f'filename == "{filename}"'
         _remove_bm25_stats_for_filename(filename)
         result = milvus_manager.delete(delete_expr)
-        parent_chunk_store.delete_by_filename(filename)
+        _delete_mysql_document_data(filename)
+        _delete_local_uploaded_file(filename)
 
         return DocumentDeleteResponse(
             filename=filename,
             chunks_deleted=result.get("delete_count", 0) if isinstance(result, dict) else 0,
-            message=f"成功删除文档 {filename} 的向量数据（本地文件已保留）",
+            message=f"成功删除文档 {filename} 的向量数据和本地文件",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"删除文档失败: {str(e)}")

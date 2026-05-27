@@ -8,8 +8,9 @@ from pymilvus import MilvusClient, DataType, AnnSearchRequest, RRFRanker
 
 load_dotenv()
 
-# Milvus 单次 query 的 limit 上限（超出会报 invalid max query result window）
+# Milvus 单次 query 的窗口上限（offset + limit 不能超过 16384）
 QUERY_MAX_LIMIT = 16384
+QUERY_BATCH_SIZE = 8192
 T = TypeVar("T")
 
 
@@ -31,10 +32,17 @@ class MilvusManager:
             if self.client is None:
                 self.client = MilvusClient(uri=self.uri)
             return self.client
-    # 判断连接断开错误
+    # 判断连接断开错误（含 MilvusException / gRPC closed channel）
     @staticmethod
     def _is_closed_channel_error(exc: Exception) -> bool:
-        return isinstance(exc, ValueError) and "closed channel" in str(exc).lower()
+        message = str(exc).lower()
+        if "closed channel" in message:
+            return True
+        if "connection refused" in message or "connection reset" in message:
+            return True
+        if "unavailable" in message and "milvus" in type(exc).__name__.lower():
+            return True
+        return False
     #安全关闭连接
     @staticmethod
     def _close_client(client) -> None:
@@ -157,19 +165,22 @@ class MilvusManager:
         out: list = []
         offset = 0
         while True:
+            limit = min(QUERY_BATCH_SIZE, QUERY_MAX_LIMIT - offset)
+            if limit <= 0:
+                break
             batch = self._run_with_reconnect(
                 lambda client: client.query(
                     collection_name=self.collection_name,
                     filter=filter_expr,
                     output_fields=fields,
-                    limit=QUERY_MAX_LIMIT,
+                    limit=limit,
                     offset=offset,
                 )
             )
             if not batch:
                 break
             out.extend(batch)
-            if len(batch) < QUERY_MAX_LIMIT:
+            if len(batch) < limit:
                 break
             offset += len(batch)
         return out
@@ -181,7 +192,7 @@ class MilvusManager:
             return []
         quoted_ids = ", ".join([f'"{item}"' for item in ids])
         filter_expr = f"chunk_id in [{quoted_ids}]"
-        return self.query(
+        return self.query_all(
             filter_expr=filter_expr,
             output_fields=[
                 "text",
@@ -194,8 +205,7 @@ class MilvusManager:
                 "chunk_level",
                 "chunk_idx",
             ],
-            limit=len(ids),
-        )
+        )[: len(ids)]
     #混合索引
     def hybrid_retrieve(
         self,

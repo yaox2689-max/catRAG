@@ -29,6 +29,9 @@ class CurrentUserResponse(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = "default_session"
+    image_context: Optional[str] = ""
+    file_name: Optional[str] = ""
+    file_content_b64: Optional[str] = ""
 
 
 class RetrievedChunk(BaseModel):
@@ -163,3 +166,10 @@ class DocumentDeleteResponse(BaseModel):
     filename: str
     chunks_deleted: int
     message: str
+
+
+class OCRUploadResponse(BaseModel):
+    filename: str
+    text: str
+    message: str
+    provider: Optional[str] = None

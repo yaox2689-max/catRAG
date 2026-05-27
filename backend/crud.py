@@ -273,7 +273,29 @@ def summarize_old_messages(model, messages: list) -> str:
     return summary
 
 
-def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: str = "default_session"):
+def _build_user_payload(
+    user_text: str,
+    image_context: str = "",
+    file_name: str = "",
+    file_content_b64: str = "",
+) -> str:
+    extra_parts = []
+    if image_context:
+        extra_parts.append(f"图片OCR内容：\n{image_context}")
+    if file_name and file_content_b64:
+        from chat_file_parser import extract_text_from_upload
+
+        extracted = extract_text_from_upload(file_name, file_content_b64)
+        if extracted:
+            extra_parts.append(f"文件名：{file_name}\n文件内容：\n{extracted}")
+        else:
+            extra_parts.append(f"文件名：{file_name}\n（未能解析出可读内容，请确认文件格式是否正确）")
+    if extra_parts:
+        return f"{user_text}\n\n" + "\n\n".join(extra_parts) if user_text else "\n\n".join(extra_parts)
+    return user_text
+
+
+def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: str = "default_session", image_context: str = "", file_name: str = "", file_content_b64: str = ""):
     """使用 Agent 处理用户消息并返回响应"""
     agent, model = _get_agent_model()
     messages = storage.load(user_id, session_id)
@@ -288,7 +310,8 @@ def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: s
             SystemMessage(content=f"之前的对话摘要：\n{summary}")
         ] + messages[40:]
 
-    messages.append(HumanMessage(content=user_text))
+    user_payload = _build_user_payload(user_text, image_context, file_name, file_content_b64)
+    messages.append(HumanMessage(content=user_payload))
     result = agent.invoke(
         {"messages": messages},
         config={"recursion_limit": 8},
@@ -322,7 +345,7 @@ def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: s
         "rag_trace": rag_trace,
     }
 
-async def chat_with_agent_stream(user_text: str, user_id: str = "default_user", session_id: str = "default_session"):
+async def chat_with_agent_stream(user_text: str, user_id: str = "default_user", session_id: str = "default_session", image_context: str = "", file_name: str = "", file_content_b64: str = ""):
     """使用 Agent 处理用户消息并流式返回响应。
     
     架构：使用统一输出队列 + 后台任务，确保 RAG 检索步骤在工具执行期间实时推送，
@@ -352,7 +375,8 @@ async def chat_with_agent_stream(user_text: str, user_id: str = "default_user", 
             SystemMessage(content=f"之前的对话摘要：\n{summary}")
         ] + messages[40:]
 
-    messages.append(HumanMessage(content=user_text))
+    user_payload = _build_user_payload(user_text, image_context, file_name, file_content_b64)
+    messages.append(HumanMessage(content=user_payload))
 
     full_response = ""
 

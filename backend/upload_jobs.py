@@ -29,6 +29,7 @@ DELETE_STEPS = [
     ("bm25", "同步 BM25 统计"),
     ("milvus", "删除向量数据"),
     ("parent_store", "删除父级分块"),
+    ("file_cleanup", "删除本地文件"),
 ]
 
 

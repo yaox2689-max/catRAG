@@ -15,6 +15,16 @@ export default {
             isComposing: false,
             documents: [],
             documentsLoading: false,
+            resourcePage: 1,
+            resourcePageSize: 6,
+            previewImageUrl: '',
+            previewImageName: '',
+            previewOcrText: '',
+            previewOcrMessage: '',
+            previewExpanded: true,
+            showImagePreview: false,
+            imageContextText: '',
+            chatAttachments: [],
             selectedFile: null,
             isUploading: false,
             uploadProgress: '',
@@ -22,6 +32,11 @@ export default {
             uploadProgressCollapsed: false,
             activeUploadJobId: '',
             uploadPollTimer: null,
+            showAttachMenu: false,
+            ocrSelectedFile: null,
+            isOcrUploading: false,
+            ocrResult: '',
+            ocrMessage: '',
             deleteJobs: {},
             deletePollTimers: {},
             deleteRemoveTimers: {},
@@ -43,6 +58,24 @@ export default {
         },
         isAdmin() {
             return this.currentUser?.role === 'admin';
+        },
+        resourceGroups() {
+            const imageExt = /\.(png|jpe?g|gif|bmp|webp|tiff?)$/i;
+            const images = (this.documents || []).filter(item => {
+                const type = (item.file_type || '').toLowerCase();
+                const name = (item.filename || '').toLowerCase();
+                return type === 'image' || imageExt.test(name);
+            });
+            const docs = (this.documents || []).filter(item => !images.some(img => img.filename === item.filename));
+            return { docs, images };
+        },
+        pagedResources() {
+            const all = this.documents || [];
+            const start = (this.resourcePage - 1) * this.resourcePageSize;
+            return all.slice(start, start + this.resourcePageSize);
+        },
+        resourceTotalPages() {
+            return Math.max(1, Math.ceil((this.documents.length || 0) / this.resourcePageSize));
         }
     },
     async mounted() {
@@ -163,8 +196,17 @@ export default {
             this.messages = [];
             this.sessions = [];
             this.documents = [];
+            this.resourcePage = 1;
+            this.previewImageUrl = '';
+            this.previewImageName = '';
+            this.previewOcrText = '';
+            this.previewOcrMessage = '';
+            this.imageContextText = '';
+            this.chatAttachments = [];
+            this.selectedFile = null;
             this.activeNav = 'newChat';
             this.showHistorySidebar = false;
+            this.showAttachMenu = false;
             localStorage.removeItem('accessToken');
         },
 
@@ -189,6 +231,104 @@ export default {
             }
         },
 
+        toggleAttachMenu() {
+            this.showAttachMenu = !this.showAttachMenu;
+        },
+
+        closeAttachMenu() {
+            this.showAttachMenu = false;
+        },
+
+        handleChatDocumentSelect(event) {
+            const files = event.target.files;
+            if (files && files.length > 0) {
+                const file = files[0];
+                const item = {
+                    id: `file_${Date.now()}_${file.name}`,
+                    kind: 'file',
+                    name: file.name,
+                    file,
+                    previewUrl: '',
+                    text: '',
+                    status: 'ready',
+                    contentB64: '',
+                    size: file.size,
+                    extension: this.getFileExtension(file.name),
+                };
+                this.chatAttachments = [item, ...this.chatAttachments.filter(v => v.kind !== 'file')];
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const result = String(reader.result || '');
+                    const commaIdx = result.indexOf(',');
+                    item.contentB64 = commaIdx >= 0 ? result.slice(commaIdx + 1) : '';
+                };
+                reader.readAsDataURL(file);
+            }
+            if (this.$refs.chatFileInput) {
+                this.$refs.chatFileInput.value = '';
+            }
+            this.closeAttachMenu();
+        },
+
+        handleChatImageSelect(event) {
+            const files = event.target.files;
+            if (files && files.length > 0) {
+                const file = files[0];
+                const previewUrl = URL.createObjectURL(file);
+                const item = {
+                    id: `image_${Date.now()}_${file.name}`,
+                    kind: 'image',
+                    name: file.name,
+                    file,
+                    previewUrl,
+                    text: '',
+                    status: 'pending',
+                    size: file.size,
+                    extension: this.getFileExtension(file.name),
+                };
+                this.chatAttachments = [item, ...this.chatAttachments.filter(v => v.kind !== 'image')];
+                this.ocrSelectedFile = file;
+                this.previewImageUrl = previewUrl;
+                this.previewImageName = file.name;
+                this.previewOcrText = '';
+                this.previewOcrMessage = '准备识别...';
+                this.ocrResult = '';
+                this.ocrMessage = '';
+                this.imageContextText = '';
+                this.uploadImageOcr(item);
+            }
+            if (this.$refs.chatImageInput) {
+                this.$refs.chatImageInput.value = '';
+            }
+            this.closeAttachMenu();
+        },
+
+        handleChatAttachClick(kind) {
+            this.closeAttachMenu();
+            if (kind === 'image' && this.$refs.chatImageInput) {
+                this.$refs.chatImageInput.click();
+            }
+            if (kind === 'document' && this.$refs.chatFileInput) {
+                this.$refs.chatFileInput.click();
+            }
+        },
+
+        openAttachment(item) {
+            if (!item) return;
+            if (item.kind === 'image' && item.previewUrl) {
+                this.previewImageUrl = item.previewUrl;
+                this.previewImageName = item.name;
+                this.previewOcrText = item.text || '';
+                this.previewOcrMessage = item.status === 'done' ? '已完成识别' : (item.status === 'pending' ? '识别中...' : '');
+                this.showImagePreview = true;
+                return;
+            }
+        },
+
+        closeImagePreview() {
+            this.showImagePreview = false;
+        },
+
         async handleSend() {
             if (!this.isAuthenticated) {
                 alert('请先登录');
@@ -196,14 +336,27 @@ export default {
             }
 
             const text = this.userInput.trim();
-            if (!text || this.isLoading || this.isComposing) return;
+            const imageContext = (this.imageContextText || '').trim();
+            const fileAttachment = this.chatAttachments.find(v => v.kind === 'file');
+            const hasFileAttachment = Boolean(fileAttachment?.contentB64);
+            if ((!text && !imageContext && !hasFileAttachment) || this.isLoading || this.isComposing) return;
 
+            const userContent = text
+                || (imageContext ? `【图片内容】\n${imageContext}` : '')
+                || (hasFileAttachment ? `【已上传文件：${fileAttachment.name}】` : '');
             this.messages.push({
-                text: text,
-                isUser: true
+                text: userContent,
+                isUser: true,
+                imageContext: imageContext || ''
             });
 
             this.userInput = '';
+            this.imageContextText = '';
+            this.previewImageUrl = '';
+            this.previewImageName = '';
+            this.previewOcrText = '';
+            this.previewOcrMessage = '';
+            this.chatAttachments = [];
             this.$nextTick(() => {
                 this.resetTextareaHeight();
                 this.scrollToBottom();
@@ -226,8 +379,11 @@ export default {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        message: text,
-                        session_id: this.sessionId
+                        message: userContent,
+                        session_id: this.sessionId,
+                        image_context: imageContext || '',
+                        file_name: fileAttachment?.name || '',
+                        file_content_b64: fileAttachment?.contentB64 || ''
                     }),
                     signal: this.abortController.signal,
                 });
@@ -437,7 +593,18 @@ export default {
                     throw new Error(data.detail || 'Failed to load documents');
                 }
                 const data = await response.json();
-                this.documents = this.mergeDocumentsWithActiveDeletes(data.documents);
+                const merged = this.mergeDocumentsWithActiveDeletes(data.documents);
+                const map = new Map();
+                merged.forEach(item => {
+                    const key = (item.filename || '').trim();
+                    if (!key) return;
+                    const prev = map.get(key);
+                    if (!prev || (Number(item.chunk_count || 0) > Number(prev.chunk_count || 0))) {
+                        map.set(key, item);
+                    }
+                });
+                this.documents = Array.from(map.values());
+                this.resourcePage = 1;
             } catch (error) {
                 alert('加载文档列表失败：' + error.message);
             } finally {
@@ -456,6 +623,22 @@ export default {
             }
         },
 
+        clearSelectedFile() {
+            this.selectedFile = null;
+            if (this.$refs.settingsFileInput) {
+                this.$refs.settingsFileInput.value = '';
+            }
+        },
+
+        handleOcrFileSelect(event) {
+            const files = event.target.files;
+            if (files && files.length > 0) {
+                this.ocrSelectedFile = files[0];
+                this.ocrResult = '';
+                this.ocrMessage = '';
+            }
+        },
+
         createUploadSteps() {
             return [
                 { key: 'upload', label: '文档上传', percent: 0, status: 'pending', message: '' },
@@ -464,6 +647,67 @@ export default {
                 { key: 'parent_store', label: '父级分块入库', percent: 0, status: 'pending', message: '' },
                 { key: 'vector_store', label: '向量化入库', percent: 0, status: 'pending', message: '' },
             ];
+        },
+
+        async uploadImageOcr(item = null) {
+            if (!this.ocrSelectedFile || this.isOcrUploading) {
+                return;
+            }
+            if (!this.isAuthenticated) {
+                alert('请先登录');
+                return;
+            }
+
+            this.isOcrUploading = true;
+            this.ocrMessage = '正在上传并识别...';
+            this.ocrResult = '';
+
+            try {
+                const formData = new FormData();
+                formData.append('file', this.ocrSelectedFile);
+
+                const response = await this.authFetch(this.isAdmin ? '/ocr/upload/admin' : '/ocr/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    throw new Error(data.detail || 'OCR 上传失败');
+                }
+
+                this.ocrMessage = `${data.message || 'OCR 完成'}${data.provider ? `（${data.provider}）` : ''}`;
+                this.ocrResult = data.text || '';
+                this.previewOcrText = this.ocrResult;
+                this.previewOcrMessage = this.ocrMessage;
+                this.imageContextText = this.ocrResult;
+                if (item) {
+                    item.text = this.ocrResult;
+                    item.status = 'done';
+                }
+                this.chatAttachments = [
+                    ...(item ? [item] : []),
+                    ...this.chatAttachments.filter(v => !item || v.id !== item.id)
+                ];
+                this.ocrSelectedFile = null;
+            } catch (error) {
+                this.ocrMessage = 'OCR 失败：' + error.message;
+                this.ocrResult = '';
+                if (item) item.status = 'failed';
+            } finally {
+                this.isOcrUploading = false;
+            }
+        },
+
+        prevResourcePage() {
+            if (this.resourcePage > 1) this.resourcePage -= 1;
+        },
+
+        nextResourcePage() {
+            if (this.resourcePage < this.resourceTotalPages) this.resourcePage += 1;
+        },
+
+        getResourcePageLabel() {
+            return `第 ${this.resourcePage} / ${this.resourceTotalPages} 页`;
         },
 
         updateUploadStep(key, percent, status = 'running', message = '') {
@@ -573,8 +817,8 @@ export default {
                         this.stopUploadJobPolling();
                         this.isUploading = false;
                         this.selectedFile = null;
-                        if (this.$refs.fileInput) {
-                            this.$refs.fileInput.value = '';
+                        if (this.$refs.settingsFileInput) {
+                            this.$refs.settingsFileInput.value = '';
                         }
                         await this.loadDocuments();
                     } else if (job.status === 'failed') {
@@ -622,6 +866,7 @@ export default {
                 { key: 'bm25', label: '同步 BM25 统计', percent: 0, status: 'pending', message: '' },
                 { key: 'milvus', label: '删除向量数据', percent: 0, status: 'pending', message: '' },
                 { key: 'parent_store', label: '删除父级分块', percent: 0, status: 'pending', message: '' },
+                { key: 'file_cleanup', label: '删除本地文件', percent: 0, status: 'pending', message: '' },
             ];
         },
 
@@ -696,16 +941,30 @@ export default {
             this.deleteRemoveTimers = rest;
         },
 
-        scheduleDeletedDocumentRemoval(filename) {
+        scheduleDeleteJobDismiss(filename, delayMs = 4000) {
             this.clearDeleteRemovalTimer(filename);
-            // 删除完成后先保留 3 秒摘要，再从当前列表移除并刷新后端状态。
-            const timer = setTimeout(async () => {
-                this.documents = this.documents.filter(doc => doc.filename !== filename);
+            const timer = setTimeout(() => {
                 const { [filename]: _job, ...jobs } = this.deleteJobs;
                 const { [filename]: _timer, ...timers } = this.deleteRemoveTimers;
                 this.deleteJobs = jobs;
                 this.deleteRemoveTimers = timers;
-                await this.loadDocuments();
+            }, delayMs);
+            this.deleteRemoveTimers = {
+                ...this.deleteRemoveTimers,
+                [filename]: timer
+            };
+        },
+
+        scheduleDeletedDocumentRemoval(filename) {
+            this.clearDeleteRemovalTimer(filename);
+            // 立即从列表中移除已删除的文档
+            this.documents = this.documents.filter(doc => doc.filename !== filename);
+            // 延迟清理 deleteJobs 数据，不再自动刷新列表
+            const timer = setTimeout(() => {
+                const { [filename]: _job, ...jobs } = this.deleteJobs;
+                const { [filename]: _timer, ...timers } = this.deleteRemoveTimers;
+                this.deleteJobs = jobs;
+                this.deleteRemoveTimers = timers;
             }, 3000);
             this.deleteRemoveTimers = {
                 ...this.deleteRemoveTimers,
@@ -732,6 +991,8 @@ export default {
                         this.scheduleDeletedDocumentRemoval(filename);
                     } else if (job.status === 'failed') {
                         this.stopDeleteJobPolling(filename);
+                        await this.loadDocuments();
+                        this.scheduleDeleteJobDismiss(filename);
                     }
                 } catch (error) {
                     this.setDeleteJob(filename, {
@@ -809,7 +1070,62 @@ export default {
                 return 'fas fa-file-excel';
             }
             return 'fas fa-file';
-        }
+        },
+
+        getFileExtension(filename) {
+            if (!filename) return '';
+            const idx = filename.lastIndexOf('.');
+            return idx >= 0 ? filename.slice(idx + 1).toUpperCase() : '';
+        },
+
+        getAttachmentBaseName(filename) {
+            if (!filename) return '';
+            const idx = filename.lastIndexOf('.');
+            return idx >= 0 ? filename.slice(0, idx) : filename;
+        },
+
+        getAttachmentFileIcon(filename) {
+            const ext = (this.getFileExtension(filename) || '').toLowerCase();
+            if (ext === 'pdf') return 'fas fa-file-pdf';
+            if (['doc', 'docx'].includes(ext)) return 'fas fa-file-word';
+            if (['xls', 'xlsx'].includes(ext)) return 'fas fa-file-excel';
+            if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(ext)) return 'fas fa-file-image';
+            if (['txt', 'md'].includes(ext)) return 'fas fa-file-lines';
+            return 'fas fa-file';
+        },
+
+        formatFileSize(bytes) {
+            if (bytes === undefined || bytes === null) return '';
+            if (bytes < 1024) return `${bytes} B`;
+            if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+            return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+        },
+
+        getImageStatusLabel(item) {
+            if (!item || item.kind !== 'image') return '';
+            if (item.status === 'pending') return '识别中...';
+            if (item.status === 'done') return '已识别';
+            if (item.status === 'error') return '识别失败';
+            return '图片';
+        },
+
+        removeAttachment(id) {
+            const item = this.chatAttachments.find(v => v.id === id);
+            if (item?.previewUrl) {
+                URL.revokeObjectURL(item.previewUrl);
+            }
+            this.chatAttachments = this.chatAttachments.filter(v => v.id !== id);
+            if (item?.kind === 'image') {
+                this.previewImageUrl = '';
+                this.previewImageName = '';
+                this.previewOcrText = '';
+                this.previewOcrMessage = '';
+                this.imageContextText = '';
+                this.ocrSelectedFile = null;
+                this.ocrResult = '';
+                this.ocrMessage = '';
+            }
+        },
     },
     watch: {
         messages: {

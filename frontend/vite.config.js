@@ -18,6 +18,7 @@ export default defineConfig({
       "/sessions": { target: apiTarget, changeOrigin: true },
       "/chat": { target: apiTarget, changeOrigin: true },
       "/documents": { target: apiTarget, changeOrigin: true },
+      "/ocr": { target: apiTarget, changeOrigin: true },
     },
   },
   build: {
