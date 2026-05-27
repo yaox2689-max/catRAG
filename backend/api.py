@@ -304,7 +304,7 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
         upload_job_manager.complete_step(job_id, "cleanup", "旧版本清理完成")
 
         failed_step = "parse"
-        upload_job_manager.update_step(job_id, "parse", 5, "running", "正在解析文档并执行三级分块")
+        upload_job_manager.update_step(job_id, "parse", 5, "running", "正在解析文档并执行语义三层分块（页/段/句）")
         new_docs = _get_document_loader().load_document(file_path, filename)
         if not new_docs:
             raise ValueError("文档处理失败，未能提取内容")

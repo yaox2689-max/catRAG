@@ -1,42 +1,28 @@
-"""文档加载和分片服务"""
+"""文档加载和语义三层分块服务。
+
+层级说明：
+- L1 整页内容 → PostgreSQL（parent_chunks）
+- L2 段落     → PostgreSQL
+- L3 句子（超长按 300 token 固定切分）→ Milvus
+"""
 import os
 from typing import Dict, List
 
+from semantic_chunker import (
+    LEVEL_3_MAX_TOKENS,
+    split_paragraphs,
+    split_sentence_to_token_chunks,
+    split_sentences,
+)
+
 
 class DocumentLoader:
-    """文档加载和分片服务"""
-    #Level 1（大块，约 1200 字）
-    #Level 2（中块，约 600 字）
-    #Level 3（小块，约 300 字）
+    """文档加载与语义三层分块。"""
+
     def __init__(self, chunk_size: int = 500, chunk_overlap: int = 50):
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-        # 保留原有参数以兼容外部调用；默认启用三层滑动窗口分块。
-        level_1_size = max(1200, chunk_size * 2)
-        level_1_overlap = max(240, chunk_overlap * 2)
-        level_2_size = max(600, chunk_size)
-        level_2_overlap = max(120, chunk_overlap)
-        level_3_size = max(300, chunk_size // 2)
-        level_3_overlap = max(60, chunk_overlap // 2)
-
-        self._splitter_level_1 = RecursiveCharacterTextSplitter(
-            chunk_size=level_1_size,
-            chunk_overlap=level_1_overlap,
-            add_start_index=True,
-            separators=["\n\n", "\n", "。", "！", "？", "，", "、", " ", ""],
-        )
-        self._splitter_level_2 = RecursiveCharacterTextSplitter(
-            chunk_size=level_2_size,
-            chunk_overlap=level_2_overlap,
-            add_start_index=True,
-            separators=["\n\n", "\n", "。", "！", "？", "，", "、", " ", ""],
-        )
-        self._splitter_level_3 = RecursiveCharacterTextSplitter(
-            chunk_size=level_3_size,
-            chunk_overlap=level_3_overlap,
-            add_start_index=True,
-            separators=["\n\n", "\n", "。", "！", "？", "，", "、", " ", ""],
-        )
+        # 保留参数以兼容旧调用；L3 长度由 CHUNK_LEVEL3_MAX_TOKENS 控制
+        self._legacy_chunk_size = chunk_size
+        self._legacy_chunk_overlap = chunk_overlap
 
     @staticmethod
     def _build_chunk_id(filename: str, page_number: int, level: int, index: int) -> str:
@@ -48,72 +34,62 @@ class DocumentLoader:
         base_doc: Dict,
         page_global_chunk_idx: int,
     ) -> List[Dict]:
-        if not text:
+        page_text = (text or "").strip()
+        if not page_text:
             return []
 
-        root_chunks: List[Dict] = []
-        #提取页码
         page_number = int(base_doc.get("page_number", 0))
-        #提取文件名
         filename = base_doc["filename"]
+        root_chunks: List[Dict] = []
 
-        level_1_docs = self._splitter_level_1.create_documents([text], [base_doc])
-        level_1_counter = 0
-        level_2_counter = 0
+        # L1：整页（语义单元 = 文档加载器给出的单页正文）
+        level_1_id = self._build_chunk_id(filename, page_number, 1, 0)
+        level_1_chunk = {
+            **base_doc,
+            "text": page_text,
+            "chunk_id": level_1_id,
+            "parent_chunk_id": "",
+            "root_chunk_id": level_1_id,
+            "chunk_level": 1,
+            "chunk_idx": page_global_chunk_idx,
+        }
+        root_chunks.append(level_1_chunk)
+        page_global_chunk_idx += 1
+
+        paragraphs = split_paragraphs(page_text)
+        if not paragraphs:
+            paragraphs = [page_text]
+
         level_3_counter = 0
-
-        for level_1_doc in level_1_docs:
-            level_1_text = (level_1_doc.page_content or "").strip()
-            if not level_1_text:
+        for para_idx, para_text in enumerate(paragraphs):
+            para_text = para_text.strip()
+            if not para_text:
                 continue
-            level_1_id = self._build_chunk_id(filename, page_number, 1, level_1_counter)
-            level_1_counter += 1
 
-            level_1_chunk = {
+            level_2_id = self._build_chunk_id(filename, page_number, 2, para_idx)
+            root_chunks.append({
                 **base_doc,
-                "text": level_1_text,
-                "chunk_id": level_1_id,
-                "parent_chunk_id": "",
+                "text": para_text,
+                "chunk_id": level_2_id,
+                "parent_chunk_id": level_1_id,
                 "root_chunk_id": level_1_id,
-                "chunk_level": 1,
+                "chunk_level": 2,
                 "chunk_idx": page_global_chunk_idx,
-            }
-            # page_global_chunk_idx是为了保证切完后还能按顺序拼回去和智能合并
-            #三个for是三级分块，大块为1，中块为2，小块为3
-            #父子切割！
+            })
             page_global_chunk_idx += 1
-            root_chunks.append(level_1_chunk)
 
-            level_2_docs = self._splitter_level_2.create_documents([level_1_text], [base_doc])
-            for level_2_doc in level_2_docs:
-                level_2_text = (level_2_doc.page_content or "").strip()
-                if not level_2_text:
-                    continue
-                level_2_id = self._build_chunk_id(filename, page_number, 2, level_2_counter)
-                level_2_counter += 1
-
-                level_2_chunk = {
-                    **base_doc,
-                    "text": level_2_text,
-                    "chunk_id": level_2_id,
-                    "parent_chunk_id": level_1_id,
-                    "root_chunk_id": level_1_id,
-                    "chunk_level": 2,
-                    "chunk_idx": page_global_chunk_idx,
-                }
-                page_global_chunk_idx += 1
-                root_chunks.append(level_2_chunk)
-
-                level_3_docs = self._splitter_level_3.create_documents([level_2_text], [base_doc])
-                for level_3_doc in level_3_docs:
-                    level_3_text = (level_3_doc.page_content or "").strip()
-                    if not level_3_text:
+            sentences = split_sentences(para_text)
+            for sent_text in sentences:
+                leaf_parts = split_sentence_to_token_chunks(sent_text, max_tokens=LEVEL_3_MAX_TOKENS)
+                for leaf_text in leaf_parts:
+                    leaf_text = leaf_text.strip()
+                    if not leaf_text:
                         continue
                     level_3_id = self._build_chunk_id(filename, page_number, 3, level_3_counter)
                     level_3_counter += 1
                     root_chunks.append({
                         **base_doc,
-                        "text": level_3_text,
+                        "text": leaf_text,
                         "chunk_id": level_3_id,
                         "parent_chunk_id": level_2_id,
                         "root_chunk_id": level_1_id,
@@ -123,16 +99,14 @@ class DocumentLoader:
                     page_global_chunk_idx += 1
 
         return root_chunks
-    #主函数
-    #加载文档
+
     def load_document(self, file_path: str, filename: str) -> list[dict]:
         """
         加载单个文档并分片
         :param file_path: 文件路径
         :param filename: 文件名
-        :return: 分片后的文档列表
+        :return: 分片后的文档列表（含 L1/L2/L3）
         """
-        #将文件名全部转换为小写，以便进行“忽略大小写”的文件类型判断。
         file_lower = filename.lower()
 
         from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader, UnstructuredExcelLoader
@@ -165,24 +139,23 @@ class DocumentLoader:
                     base_doc=base_doc,
                     page_global_chunk_idx=page_global_chunk_idx,
                 )
-                #三级切割后idx再加
                 page_global_chunk_idx += len(page_chunks)
                 documents.extend(page_chunks)
             return documents
         except Exception as e:
             raise Exception(f"处理文档失败: {str(e)}")
-    #收集切割后的小块chunk
+
     def load_documents_from_folder(self, folder_path: str) -> list[dict]:
-        """
-        从文件夹加载所有文档并分片
-        :param folder_path: 文件夹路径
-        :return: 所有分片后的文档列表
-        """
+        """从文件夹加载所有文档并分片。"""
         all_documents = []
 
         for filename in os.listdir(folder_path):
             file_lower = filename.lower()
-            if not (file_lower.endswith(".pdf") or file_lower.endswith((".docx", ".doc")) or file_lower.endswith((".xlsx", ".xls"))):
+            if not (
+                file_lower.endswith(".pdf")
+                or file_lower.endswith((".docx", ".doc"))
+                or file_lower.endswith((".xlsx", ".xls"))
+            ):
                 continue
 
             file_path = os.path.join(folder_path, filename)
