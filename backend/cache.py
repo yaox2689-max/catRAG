@@ -9,7 +9,7 @@ class RedisCache:
     def __init__(self):
         self.redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         self.key_prefix = os.getenv("REDIS_KEY_PREFIX", "supermew")
-        self.default_ttl = int(os.getenv("REDIS_CACHE_TTL_SECONDS", "300"))
+        self.default_ttl = int(os.getenv("REDIS_CACHE_TTL_SECONDS", "1800"))
         self._client = None
 
     def _get_client(self):

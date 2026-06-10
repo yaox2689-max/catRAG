@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -271,12 +273,6 @@ async def _save_upload_file(file: UploadFile, file_path: Path) -> None:
                 break
             f.write(chunk)
 
-
-def _extract_image_ocr_text(file_path: str, filename: str) -> str:
-    """OCR 占位接口：在这里接入你的 OCR 引擎。"""
-    # TODO: 在这里接入 OCR（例如 PaddleOCR / EasyOCR / Tesseract / 云 OCR 服务）
-    # 返回识别到的纯文本；识别失败时返回空字符串或抛出异常均可。
-    raise NotImplementedError("OCR 尚未接入，请在 _extract_image_ocr_text 中实现")
 
 
 def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:

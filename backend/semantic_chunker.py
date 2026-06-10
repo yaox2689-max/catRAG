@@ -10,7 +10,8 @@ LEVEL_3_MAX_TOKENS = int(os.getenv("CHUNK_LEVEL3_MAX_TOKENS", "300"))
 LEVEL_3_TOKEN_OVERLAP = int(os.getenv("CHUNK_LEVEL3_TOKEN_OVERLAP", "30"))
 
 # 中英文句子切分（保留标点在前一句末尾）
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？；!?])\s*")
+# 注意：分号 ； 不作为主分割点，因为法律条文的列举项（（一）；（二）；（三））应保留为同一句
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])\s*")
 # 段落：空行、缩进换行
 _PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n+")
 
@@ -41,8 +42,8 @@ def split_sentences(paragraph_text: str) -> List[str]:
 
     parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text) if p.strip()]
     if len(parts) <= 1 and len(text) > 400:
-        # 无标点长段落：按逗号、分号次级切分
-        parts = [p.strip() for p in re.split(r"(?<=[，,；;])\s*", text) if p.strip()]
+        # 无标点长段落：按逗号次级切分（不按分号，保留法律列举完整性）
+        parts = [p.strip() for p in re.split(r"(?<=[，,])\s*", text) if p.strip()]
     return parts if parts else [text]
 
 

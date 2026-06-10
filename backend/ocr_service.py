@@ -12,7 +12,6 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_PROJECT_ROOT / ".env")
 load_dotenv(_PROJECT_ROOT / ".env.local", override=False)
 
-OCR_PROVIDER = (os.getenv("OCR_PROVIDER") or "baidu").strip().lower()
 BAIDU_OCR_API_KEY = os.getenv("BAIDU_OCR_API_KEY") or ""
 BAIDU_OCR_SECRET_KEY = os.getenv("BAIDU_OCR_SECRET_KEY") or ""
 BAIDU_OCR_URL = os.getenv(
@@ -42,29 +41,21 @@ def _get_baidu_access_token() -> str | None:
         )
         resp.raise_for_status()
         data = resp.json()
-        token = data.get("access_token")
-        return token or None
+        return data.get("access_token") or None
     except Exception:
         return None
 
 
 def recognize_image_bytes(image_bytes: bytes, filename: str = "") -> dict[str, Any]:
-    provider = OCR_PROVIDER or "baidu"
-    if provider != "baidu":
-        return {
-            "provider": provider,
-            "filename": filename,
-            "text": "",
-            "raw": None,
-        }
-
+    text, raw = "", None
     token = _get_baidu_access_token()
     if not token:
         return {
-            "provider": provider,
+            "provider": "baidu",
             "filename": filename,
             "text": "",
             "raw": None,
+            "errors": ["百度 OCR 未配置，请设置 BAIDU_OCR_API_KEY 和 BAIDU_OCR_SECRET_KEY"],
         }
 
     try:
@@ -86,15 +77,17 @@ def recognize_image_bytes(image_bytes: bytes, filename: str = "") -> dict[str, A
 
         text = "\n".join(words).strip()
         return {
-            "provider": provider,
+            "provider": "baidu",
             "filename": filename,
             "text": text,
             "raw": data,
+            "errors": None,
         }
-    except Exception:
+    except Exception as e:
         return {
-            "provider": provider,
+            "provider": "baidu",
             "filename": filename,
             "text": "",
             "raw": None,
+            "errors": [str(e)],
         }

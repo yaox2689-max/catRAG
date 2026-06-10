@@ -11,6 +11,52 @@ from sqlbase import User, ChatSession, ChatMessage
 
 load_dotenv()
 
+# Token 预算管理常量
+WATERMARK_TOKENS = int(os.getenv("WATERMARK_TOKENS", "22000"))  # 触发摘要的水位线
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "25000"))  # 总上下文硬上限
+KEEP_RECENT_MESSAGES = int(os.getenv("KEEP_RECENT_MESSAGES", "10"))  # 摘要时保留最近消息数
+
+_tiktoken_encoder = None
+
+def _get_encoder():
+    global _tiktoken_encoder
+    if _tiktoken_encoder is None:
+        import tiktoken
+        _tiktoken_encoder = tiktoken.get_encoding("cl100k_base")
+    return _tiktoken_encoder
+
+def _count_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return len(_get_encoder().encode(text))
+
+def _count_message_tokens(messages: list) -> int:
+    total = 0
+    for msg in messages:
+        content = msg.content if hasattr(msg, "content") else str(msg)
+        total += _count_tokens(content) + 4  # role formatting overhead
+    return total
+
+def _check_token_watermark(messages: list, model) -> list:
+    """检查 token 水位线，超过阈值时触发摘要压缩。返回处理后的消息列表。"""
+    total = _count_message_tokens(messages)
+    if total <= WATERMARK_TOKENS:
+        return messages
+
+    if len(messages) <= KEEP_RECENT_MESSAGES:
+        return messages
+
+    old_messages = messages[:-KEEP_RECENT_MESSAGES]
+    recent_messages = messages[-KEEP_RECENT_MESSAGES:]
+    old_tokens = _count_message_tokens(old_messages)
+
+    if old_tokens < 500:
+        return messages
+
+    summary = summarize_old_messages(model, old_messages)
+    summary_msg = SystemMessage(content=f"之前的对话摘要：\n{summary}")
+    return [summary_msg] + recent_messages
+
 API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
 BASE_URL = os.getenv("BASE_URL")
@@ -256,18 +302,23 @@ def _get_agent_model():
 storage = ConversationStorage()
 
 def summarize_old_messages(model, messages: list) -> str:
-    """将旧消息总结为摘要"""
-    # 提取旧对话
+    """将旧消息总结为结构化摘要"""
     old_conversation = "\n".join([
         f"{'用户' if msg.type == 'human' else 'AI'}: {msg.content}"
         for msg in messages
     ])
 
-    # 生成摘要
-    summary_prompt = f"""请总结以下对话的关键信息：
+    summary_prompt = f"""请对以下对话生成结构化摘要，包含以下维度：
+1. 用户身份与背景（如有提及）
+2. 已讨论的法律领域和关键问题
+3. 已解决的问题和关键结论
+4. 未解决的问题或待跟进事项
+5. 用户的偏好和特殊要求
 
+对话内容：
 {old_conversation}
-总结（包含用户信息、重要事实、待办事项）："""
+
+结构化摘要："""
 
     summary = model.invoke(summary_prompt).content
     return summary
@@ -303,12 +354,9 @@ def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: s
     # 清理可能残留的 RAG 上下文，避免跨请求污染
     get_last_rag_context(clear=True)
     reset_tool_call_guards()
-    
-    if len(messages) > 50:
-        summary = summarize_old_messages(model, messages[:40])
-        messages = [
-            SystemMessage(content=f"之前的对话摘要：\n{summary}")
-        ] + messages[40:]
+
+    # Token 水位线管理：超过阈值时自动摘要压缩
+    messages = _check_token_watermark(messages, model)
 
     user_payload = _build_user_payload(user_text, image_context, file_name, file_content_b64)
     messages.append(HumanMessage(content=user_payload))
@@ -369,11 +417,8 @@ async def chat_with_agent_stream(user_text: str, user_id: str = "default_user", 
 
     set_rag_step_queue(_RagStepProxy())
 
-    if len(messages) > 50:
-        summary = summarize_old_messages(model, messages[:40])
-        messages = [
-            SystemMessage(content=f"之前的对话摘要：\n{summary}")
-        ] + messages[40:]
+    # Token 水位线管理：超过阈值时自动摘要压缩
+    messages = _check_token_watermark(messages, model)
 
     user_payload = _build_user_payload(user_text, image_context, file_name, file_content_b64)
     messages.append(HumanMessage(content=user_payload))

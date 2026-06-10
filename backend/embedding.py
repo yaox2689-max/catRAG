@@ -1,4 +1,6 @@
 """文本向量化服务 - 支持密集向量和稀疏向量（BM25），词表与 df 持久化 + 增量更新"""
+from __future__ import annotations
+
 import json
 import math
 import os
@@ -170,18 +172,22 @@ class EmbeddingService:
     def tokenize(self, text: str) -> list[str]:
         text = text.lower()
         tokens = []
-        chinese_pattern = re.compile(r"[\u4e00-\u9fff]")    # 匹配单个中文字符
-        english_pattern = re.compile(r"[a-zA-Z]+")          # 匹配连续英文字母
+        chinese_pattern = re.compile(r"[一-鿿]")
+        english_pattern = re.compile(r"[a-zA-Z]+")
+        number_pattern = re.compile(r"\d+")
         i = 0
         while i < len(text):
-            #如果是中文则直接token+1
             char = text[i]
             if chinese_pattern.match(char):
                 tokens.append(char)
                 i += 1
-            #如果是英文则匹配连续英文如study则token+1
             elif english_pattern.match(char):
                 match = english_pattern.match(text[i:])
+                if match:
+                    tokens.append(match.group())
+                    i += len(match.group())
+            elif number_pattern.match(char):
+                match = number_pattern.match(text[i:])
                 if match:
                     tokens.append(match.group())
                     i += len(match.group())

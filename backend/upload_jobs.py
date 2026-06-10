@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from datetime import UTC, datetime
 from threading import Lock
@@ -43,6 +44,17 @@ class UploadJobManager:
     def __init__(self):
         self._jobs: dict[str, dict] = {}
         self._lock = Lock()
+        self._max_age_seconds = int(os.getenv("UPLOAD_JOB_MAX_AGE", "3600"))
+
+    def _cleanup_expired(self) -> None:
+        """惰性清理过期任务（调用方需持有 _lock）。"""
+        now = datetime.now(UTC)
+        expired = [
+            job_id for job_id, job in self._jobs.items()
+            if (now - datetime.fromisoformat(job.get("updated_at", now.isoformat()))).total_seconds() > self._max_age_seconds
+        ]
+        for job_id in expired:
+            del self._jobs[job_id]
 
     def create_job(
         self,
@@ -86,6 +98,7 @@ class UploadJobManager:
 
     def get_job(self, job_id: str) -> dict | None:
         with self._lock:
+            self._cleanup_expired()
             job = self._jobs.get(job_id)
             return deepcopy(job) if job else None
 
@@ -162,6 +175,7 @@ class UploadJobManager:
 
     def list_jobs(self) -> list[dict]:
         with self._lock:
+            self._cleanup_expired()
             return [deepcopy(job) for job in self._jobs.values()]
 
     @staticmethod

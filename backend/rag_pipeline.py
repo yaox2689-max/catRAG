@@ -13,7 +13,7 @@ load_dotenv()
 API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
 BASE_URL = os.getenv("BASE_URL")
-GRADE_MODEL = os.getenv("GRADE_MODEL", "qwen3.6-plus")
+GRADE_MODEL = os.getenv("GRADE_MODEL", "qwen3-max")
 
 _grader_model = None
 _router_model = None
@@ -94,6 +94,7 @@ class RAGState(TypedDict):
     step_back_answer: Optional[str]
     hypothetical_doc: Optional[str]
     rag_trace: Optional[dict]
+    retry_count: int
 
 
 def _format_docs(docs: List[dict]) -> str:
@@ -369,12 +370,60 @@ def retrieve_expanded(state: RAGState) -> RAGState:
     return {"docs": deduped, "context": context, "rag_trace": rag_trace}
 
 
+def grade_expanded_node(state: RAGState) -> RAGState:
+    """对扩展检索结果做二次评估，如果仍不相关且未超过重试上限则回退。"""
+    grader = _get_grader_model()
+    emit_rag_step("📊", "正在评估扩展检索结果...")
+    if not grader:
+        # 无 grader 模型时直接放行
+        rag_trace = state.get("rag_trace", {}) or {}
+        rag_trace.update({"expanded_grade_score": "unknown", "expanded_grade_route": "end"})
+        return {"route": "end", "rag_trace": rag_trace}
+
+    question = state["question"]
+    context = state.get("context", "")
+    prompt = GRADE_PROMPT.format(question=question, context=context)
+    response = grader.with_structured_output(GradeDocuments).invoke(
+        [{"role": "user", "content": prompt}]
+    )
+    score = (response.binary_score or "").strip().lower()
+
+    retry_count = state.get("retry_count", 0)
+
+    if score == "yes":
+        route = "end"
+        emit_rag_step("✅", "扩展检索评估通过", f"评分: {score}")
+    elif retry_count >= 1:
+        # 已重试过，不再循环，返回当前结果
+        route = "end"
+        emit_rag_step("⚠️", "扩展检索仍不理想，已达重试上限", f"评分: {score}, 重试: {retry_count}")
+    else:
+        route = "fallback_initial"
+        emit_rag_step("⚠️", "扩展检索结果不相关，回退到原始检索", f"评分: {score}")
+
+    rag_trace = state.get("rag_trace", {}) or {}
+    rag_trace.update({
+        "expanded_grade_score": score,
+        "expanded_grade_route": route,
+    })
+    return {"route": route, "rag_trace": rag_trace}
+
+
+def increment_retry(state: RAGState) -> RAGState:
+    """增加重试计数器，用于回退到初始检索。"""
+    retry_count = state.get("retry_count", 0) + 1
+    emit_rag_step("🔄", f"回退到原始查询重新检索（第 {retry_count} 次回退）")
+    return {"retry_count": retry_count}
+
+
 def build_rag_graph():
     graph = StateGraph(RAGState)
     graph.add_node("retrieve_initial", retrieve_initial)
     graph.add_node("grade_documents", grade_documents_node)
     graph.add_node("rewrite_question", rewrite_question_node)
     graph.add_node("retrieve_expanded", retrieve_expanded)
+    graph.add_node("grade_expanded", grade_expanded_node)
+    graph.add_node("increment_retry", increment_retry)
 
     graph.set_entry_point("retrieve_initial")
     graph.add_edge("retrieve_initial", "grade_documents")
@@ -387,7 +436,16 @@ def build_rag_graph():
         },
     )
     graph.add_edge("rewrite_question", "retrieve_expanded")
-    graph.add_edge("retrieve_expanded", END)
+    graph.add_edge("retrieve_expanded", "grade_expanded")
+    graph.add_conditional_edges(
+        "grade_expanded",
+        lambda state: state.get("route"),
+        {
+            "end": END,
+            "fallback_initial": "increment_retry",
+        },
+    )
+    graph.add_edge("increment_retry", "retrieve_initial")
     return graph.compile()
 
 
@@ -407,4 +465,5 @@ def run_rag_graph(question: str) -> dict:
         "step_back_answer": None,
         "hypothetical_doc": None,
         "rag_trace": None,
+        "retry_count": 0,
     })

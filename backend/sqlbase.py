@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 
 from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -41,7 +42,7 @@ class ChatMessage(Base):
     message_type: Mapped[str] = mapped_column(String(20), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    rag_trace: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    rag_trace: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     session = relationship("ChatSession", back_populates="messages")
 

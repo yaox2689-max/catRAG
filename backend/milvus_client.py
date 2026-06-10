@@ -1,4 +1,6 @@
 """Milvus 客户端 - 支持密集向量+稀疏向量混合检索"""
+from __future__ import annotations
+
 import os
 import threading
 from typing import Callable, TypeVar
