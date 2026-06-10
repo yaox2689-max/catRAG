@@ -57,7 +57,6 @@ body {
     display: flex;
     flex-direction: column;
     border-right: 1px solid rgba(0,0,0,0.05);
-    transition: var(--transition);
 }
 
 .sidebar-header {
@@ -773,13 +772,13 @@ textarea {
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    transition: var(--transition);
+    transition: background-color 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
     box-shadow: 0 4px 10px rgba(255, 158, 153, 0.3);
 }
 
 .send-btn:hover {
-    transform: scale(1.1) rotate(-10deg);
     background-color: #ff8e89;
+    box-shadow: 0 6px 16px rgba(255, 158, 153, 0.4);
 }
 
 .footer-text {

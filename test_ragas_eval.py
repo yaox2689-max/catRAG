@@ -1,15 +1,23 @@
 """
-RAGAS 评估脚本。
+RAGAS 端到端评估脚本。
 
-Faithfulness（忠实度）：衡量「模型回答」中的陈述能否从「检索到的 contexts」中推断出来，
-与 CSV 里的 ground_truth 无直接关系；判分依赖 RAGAS 使用的 LLM（RAGAS_EVAL_MODEL / MODEL）。
+流程：CSV 黄金集 → run_rag_graph 检索 → LLM 基于 context 生成答案 → RAGAS 多指标打分。
 
-其它指标：answer_relevancy 需要本地/云端 embeddings；context_precision / context_recall 需要 ground_truth。
+指标说明（均为 0~1，越高越好）：
+  - faithfulness：答案陈述是否可由检索上下文支撑（抗幻觉）
+  - answer_relevancy：答案与问题的语义相关度（需 embedding）
+  - context_precision：检索片段与参考答案的精确度（需 ground_truth）
+  - context_recall：参考答案要点是否被检索上下文覆盖（需 ground_truth）
+  - answer_correctness：答案与参考答案的一致性（需 ground_truth + embedding + LLM，complete 预设）
 """
+from __future__ import annotations
+
 import argparse
 import csv
 import os
+import shutil
 import sys
+from datetime import datetime
 from typing import Any
 
 from dotenv import load_dotenv
@@ -23,6 +31,11 @@ from ragas.metrics._context_precision import context_precision
 from ragas.metrics._context_recall import context_recall
 from ragas.metrics._faithfulness import faithfulness
 
+try:
+    from ragas.metrics._answer_correctness import answer_correctness as _answer_correctness
+except ImportError:
+    _answer_correctness = None
+
 load_dotenv()
 backend_path = os.path.join(os.path.dirname(__file__), "backend")
 sys.path.append(backend_path)
@@ -30,11 +43,29 @@ sys.path.append(backend_path)
 from rag_pipeline import run_rag_graph
 
 DEFAULT_GOLD_CSV = os.path.join(os.path.dirname(__file__), "data", "ragas_eval_gold.csv")
+DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 _ANSWER_SYSTEM = (
     "你是法律咨询助手。请仅根据「参考资料」作答；若资料不足以得出结论，请明确说明。"
     "不要编造参考资料中未出现的条文编号或事实；回答使用简洁中文。"
 )
+
+# RAGAS 结果列名 → 中文说明（用于终端汇总）
+METRIC_DESCRIPTIONS: dict[str, str] = {
+    "faithfulness": "忠实度：答案是否被检索上下文支撑",
+    "answer_relevancy": "答案相关度：回答与问题的语义匹配",
+    "context_precision": "上下文精确度：检索片段是否精准相关",
+    "context_recall": "上下文召回：标准答案要点是否被检索覆盖",
+    "answer_correctness": "答案正确性：与参考答案的一致性（含语义+事实）",
+}
+
+METRIC_PRESETS: dict[str, str] = {
+    "faithfulness": "仅忠实度（最快，不需 ground_truth 判分逻辑外的约束）",
+    "retrieval": "仅检索：context_precision + context_recall",
+    "standard": "faithfulness + context_precision + context_recall（推荐，不需 answer_relevancy 向量）",
+    "full": "faithfulness + answer_relevancy + context_precision + context_recall（默认全面评测）",
+    "complete": "full + answer_correctness（最全面，需 ground_truth 与 embedding）",
+}
 
 
 def _load_gold_rows(path: str) -> list[dict[str, str]]:
@@ -88,57 +119,164 @@ def generate_rag_answer(llm: Any, question: str, context: str) -> str:
     return (getattr(msg, "content", None) or "").strip()
 
 
-def _resolve_metrics(preset: str) -> tuple[list, bool]:
+def _resolve_metrics(preset: str) -> tuple[list, bool, bool]:
     """
-    返回 (metrics 列表, 是否需要 HuggingFaceEmbeddings)。
-    legacy evaluate() 仅接受 ragas.metrics.base.Metric 实例。
+    返回 (metrics 列表, 是否需要 HuggingFaceEmbeddings, 是否必须有 ground_truth)。
     """
     p = (preset or "full").strip().lower()
-    if p in ("faithfulness", "f"):
-        return [faithfulness], False
-    if p in ("no-relevancy", "faithfulness+ctx", "f+ctx"):
-        return [faithfulness, context_precision, context_recall], False
-    if p in ("full", "all"):
-        return [faithfulness, answer_relevancy, context_precision, context_recall], True
-    raise ValueError(
-        f"未知 --metrics={preset!r}，请使用: faithfulness | no-relevancy | full"
+    aliases = {
+        "f": "faithfulness",
+        "no-relevancy": "standard",
+        "faithfulness+ctx": "standard",
+        "f+ctx": "standard",
+        "all": "full",
+    }
+    p = aliases.get(p, p)
+
+    if p == "faithfulness":
+        return [faithfulness], False, False
+    if p == "retrieval":
+        return [context_precision, context_recall], False, True
+    if p == "standard":
+        return [faithfulness, context_precision, context_recall], False, True
+    if p == "full":
+        return [
+            faithfulness,
+            answer_relevancy,
+            context_precision,
+            context_recall,
+        ], True, True
+    if p == "complete":
+        metrics = [
+            faithfulness,
+            answer_relevancy,
+            context_precision,
+            context_recall,
+        ]
+        if _answer_correctness is not None:
+            metrics.append(_answer_correctness)
+        else:
+            print("⚠️ 当前 ragas 版本无 answer_correctness，complete 将等同 full。")
+        return metrics, True, True
+
+    valid = ", ".join(sorted(METRIC_PRESETS))
+    raise ValueError(f"未知 --metrics={preset!r}，可选: {valid}")
+
+
+def _metric_requires_ground_truth(metric: Any) -> bool:
+    return metric in (
+        context_precision,
+        context_recall,
+        _answer_correctness,
     )
+
+
+def _print_preset_help() -> None:
+    print("\n📖 指标预设 (--metrics):")
+    for name, desc in METRIC_PRESETS.items():
+        print(f"  {name:14} {desc}")
+    print("\n📖 各指标含义:")
+    for key, desc in METRIC_DESCRIPTIONS.items():
+        print(f"  {key:22} {desc}")
+
+
+def _summarize_metrics(df: Any, metric_columns: list[str]) -> None:
+    print("\n" + "=" * 60)
+    print("📈 RAGAS 指标汇总（均值 / 标准差 / 有效样本数）")
+    print("=" * 60)
+    for col in metric_columns:
+        if col not in df.columns:
+            continue
+        series = df[col].dropna()
+        if len(series) == 0:
+            print(f"  {col}: 无有效分数")
+            continue
+        mean_v = float(series.mean())
+        std_v = float(series.std()) if len(series) > 1 else 0.0
+        desc = METRIC_DESCRIPTIONS.get(col, "")
+        print(f"\n  ⭐ {col}")
+        if desc:
+            print(f"     {desc}")
+        print(f"     均值: {mean_v:.4f}  标准差: {std_v:.4f}  样本数: {len(series)}/{len(df)}")
+
+
+def _save_results(
+    df: Any,
+    output_path: str,
+    sample_ids: list[str],
+    *,
+    verbose: bool = True,
+) -> str:
+    out_df = df.copy()
+    if sample_ids and len(sample_ids) == len(out_df):
+        out_df.insert(0, "id", sample_ids)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    out_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    abs_path = os.path.abspath(output_path)
+    if verbose:
+        print(f"\n💾 明细结果已保存: {abs_path}")
+    return abs_path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="RAGAS 评估：从 CSV 读题，run_rag_graph 检索 + LLM 生成答案后打分。",
+        description="RAGAS 评估：从 CSV 读题，run_rag_graph 检索 + LLM 生成答案后多指标打分。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-指标预设 (--metrics):
-  faithfulness   仅忠实度（答案是否被 contexts 支撑）；只需判分 LLM，无需本地向量模型。
-  no-relevancy   faithfulness + context_precision + context_recall；不需 answer_relevancy 的向量。
-  full           上述全部 + answer_relevancy（需 EMBEDDING_MODEL 本地加载）。
+示例:
+  uv run test_ragas_eval.py
+  uv run test_ragas_eval.py --metrics full
+  uv run test_ragas_eval.py --metrics standard --limit 5
+  uv run test_ragas_eval.py --metrics complete --output data/ragas_eval_results.csv
 
-环境变量: ARK_API_KEY, BASE_URL, MODEL 或 RAGAS_EVAL_MODEL；可选 RAGAS_ANSWER_MODEL / FAST_MODEL。
+环境变量: ARK_API_KEY, BASE_URL, MODEL 或 RAGAS_EVAL_MODEL；
+          RAGAS_ANSWER_MODEL / FAST_MODEL；EMBEDDING_MODEL / EMBEDDING_DEVICE；
+          RAGAS_METRICS（默认 full）、RAGAS_EVAL_CSV、RAGAS_EVAL_OUTPUT。
 """,
     )
     parser.add_argument(
         "--csv",
         default=os.getenv("RAGAS_EVAL_CSV", DEFAULT_GOLD_CSV),
-        help="黄金集 CSV（需 question；ground_truth 在 full/no-relevancy 下用于 context 指标）",
+        help="黄金集 CSV（需 question；context/正确性类指标需 ground_truth）",
     )
     parser.add_argument(
         "--metrics",
-        default=os.getenv("RAGAS_METRICS", "faithfulness"),
+        default=os.getenv("RAGAS_METRICS", "full"),
         metavar="PRESET",
-        help="faithfulness | no-relevancy | full（默认 faithfulness；可用环境变量 RAGAS_METRICS）",
+        help="预设: faithfulness | retrieval | standard | full | complete（默认 full）",
+    )
+    parser.add_argument(
+        "--output",
+        default=os.getenv("RAGAS_EVAL_OUTPUT", ""),
+        help="结果 CSV 路径（默认 data/ragas_eval_results_<时间戳>.csv）",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="仅评测前 N 条（0 表示全部，用于快速试跑）",
+    )
+    parser.add_argument(
+        "--list-metrics",
+        action="store_true",
+        help="打印预设与指标说明后退出",
     )
     args = parser.parse_args()
 
+    if args.list_metrics:
+        _print_preset_help()
+        return
+
     try:
-        metrics_list, need_embeddings = _resolve_metrics(args.metrics)
+        metrics_list, need_embeddings, preset_needs_gt = _resolve_metrics(args.metrics)
     except ValueError as e:
         print(f"❌ {e}")
+        _print_preset_help()
         sys.exit(2)
 
-    needs_ground_truth = any(
-        m is context_precision or m is context_recall for m in metrics_list
+    metric_names = [m.name for m in metrics_list]
+    needs_ground_truth = preset_needs_gt or any(
+        _metric_requires_ground_truth(m) for m in metrics_list
     )
 
     api_key = os.getenv("ARK_API_KEY")
@@ -164,7 +302,21 @@ def main() -> None:
         print(f"❌ 读取测试集失败: {e}")
         sys.exit(1)
 
+    if args.limit > 0:
+        test_rows = test_rows[: args.limit]
+        print(f"⚠️ --limit={args.limit}，仅评测前 {len(test_rows)} 条")
+
+    missing_gt = sum(1 for r in test_rows if not r["ground_truth"])
+    if needs_ground_truth and missing_gt:
+        print(
+            f"⚠️ 有 {missing_gt}/{len(test_rows)} 条缺少 ground_truth，"
+            "context_precision / context_recall / answer_correctness 将跳过这些行。"
+        )
+
     print(f"📂 已加载 {len(test_rows)} 条黄金集：{os.path.abspath(args.csv)}")
+    print(f"📊 评测预设: {args.metrics} → 指标: {metric_names}")
+    if need_embeddings:
+        print(f"📊 将加载本地 embedding: {os.getenv('EMBEDDING_MODEL', 'BAAI/bge-m3')}")
     print("🚀 运行检索并生成答案（与线上一致：run_rag_graph + LLM 基于 context 作答）...")
 
     answer_llm = init_chat_model(
@@ -176,10 +328,18 @@ def main() -> None:
     )
 
     data: list[dict[str, Any]] = []
+    sample_ids: list[str] = []
+    skipped_no_gt = 0
+
     for row in test_rows:
         question = row["question"]
         ground_truth = row["ground_truth"]
-        rid = row["id"]
+        rid = row["id"] or str(len(sample_ids) + 1)
+
+        if needs_ground_truth and not ground_truth:
+            skipped_no_gt += 1
+            print(f"  ⊘ id={rid} 跳过（无 ground_truth）: {question[:40]}…")
+            continue
 
         rag_result = run_rag_graph(question)
         if not isinstance(rag_result, dict):
@@ -203,31 +363,30 @@ def main() -> None:
         context = _retrieval_context(rag_result)
         answer = generate_rag_answer(answer_llm, question, context)
 
-        if needs_ground_truth and not ground_truth:
-            print(f"⚠️ 当前指标需要 ground_truth，已跳过：id={rid!r}")
-            continue
-
         data.append(
             {
                 "question": question,
                 "answer": answer,
                 "contexts": chunks if chunks else ["No context retrieved"],
-                # context_precision/recall 映射为 reference；faithfulness-only 时可为空字符串
-                "ground_truth": ground_truth if ground_truth else "",
+                "ground_truth": ground_truth,
             }
         )
+        sample_ids.append(rid)
         preview = answer[:80] + ("…" if len(answer) > 80 else "")
-        print(f"  ✓ id={rid or '-'} 答案预览: {preview}")
+        n_ctx = len(chunks)
+        print(f"  ✓ id={rid} chunks={n_ctx} 答案预览: {preview}")
+
+    if skipped_no_gt:
+        print(f"ℹ️ 因缺少 ground_truth 跳过 {skipped_no_gt} 条")
 
     if not data:
-        print("❌ 未能收集到任何有效数据，请检查 run_rag_graph 与 CSV。")
+        print("❌ 未能收集到任何有效数据，请检查 run_rag_graph、CSV 与 ground_truth。")
         sys.exit(1)
 
     dataset = Dataset.from_list(data)
-    print(f"📦 已构建 HuggingFace Dataset，共 {len(dataset)} 条")
-    print(f"📊 RAGAS 指标: {[m.name for m in metrics_list]}")
+    print(f"\n📦 已构建 HuggingFace Dataset，共 {len(dataset)} 条")
+    print("📊 正在计算 RAGAS 指标（LLM 判分 + 可选 embedding）...")
 
-    print("📊 正在计算 RAGAS 指标...")
     ragas_llm = init_chat_model(
         model=eval_model,
         model_provider="openai",
@@ -260,13 +419,31 @@ def main() -> None:
         if ragas_embeddings is not None:
             eval_kw["embeddings"] = ragas_embeddings
         score = evaluate(**eval_kw)
-        print("\n✅ 评估完成！结果如下:")
         df = score.to_pandas()
-        print(df)
-        if "faithfulness" in df.columns:
-            s = df["faithfulness"]
-            mean_f = float(s.mean()) if len(s) else float("nan")
-            print(f"\n⭐ Faithfulness 均值: {mean_f:.4f}（1 表示回答陈述均可被上下文支持；越低表示幻觉/脱离上下文越多）")
+
+        display_cols = ["user_input"] if "user_input" in df.columns else []
+        if "user_input" not in display_cols and "question" in df.columns:
+            display_cols = ["question"]
+        display_cols.extend(metric_names)
+        existing_display = [c for c in display_cols if c in df.columns]
+
+        print("\n✅ 评估完成！逐条分数（节选）:")
+        print(df[existing_display].to_string())
+
+        _summarize_metrics(df, metric_names)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = (args.output or "").strip()
+        if not output_path:
+            output_path = os.path.join(
+                DEFAULT_OUTPUT_DIR,
+                f"ragas_eval_results_{timestamp}.csv",
+            )
+        saved_path = _save_results(df, output_path, sample_ids)
+        latest_path = os.path.join(DEFAULT_OUTPUT_DIR, "ragas_eval_results_latest.csv")
+        shutil.copy2(saved_path, latest_path)
+        print(f"💾 同步最新副本: {os.path.abspath(latest_path)}")
+
     except Exception as e:
         print(f"❌ 评估失败: {e}")
         import traceback
