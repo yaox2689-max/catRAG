@@ -1,5 +1,11 @@
 # 喵呜助手 · catRAG
 
+![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)
+![Vue.js](https://img.shields.io/badge/Vue.js-3.x-brightgreen.svg)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
+
 面向法律知识场景的 **RAG 智能问答系统**，支持 PDF / Word / Excel 异步入库、图片 OCR、混合向量检索、LangGraph 可编排检索链路、SSE 流式对话与全链路 `rag_trace` 追溯。
 
 **仓库地址：** [https://github.com/yaox2689-max/catRAG](https://github.com/yaox2689-max/catRAG)
@@ -237,6 +243,62 @@ uv run python test_ragas_eval.py --csv data/ragas_eval_gold.csv --preset standar
 
 ---
 
+## 开发指南
+
+### 分支策略
+
+本项目采用 **Git Flow** 分支策略：
+
+```
+main          # 生产分支，只接受 PR 合并
+├── develop   # 开发分支，功能合并到这里
+├── feature/* # 功能分支，从 develop 创建
+├── fix/*     # 修复分支
+└── release/* # 发布分支
+```
+
+**工作流程：**
+1. 从 `develop` 创建功能分支：`git checkout -b feature/your-feature develop`
+2. 开发完成后推送：`git push origin feature/your-feature`
+3. 在 GitHub 创建 Pull Request 到 `develop`
+4. 代码审查后合并
+
+### 提交规范
+
+使用 **Conventional Commits** 格式：
+
+```
+<type>(<scope>): <description>
+
+[optional body]
+[optional footer]
+```
+
+**类型：**
+- `feat`: 新功能
+- `fix`: 修复 bug
+- `docs`: 文档更新
+- `style`: 代码格式（不影响功能）
+- `refactor`: 重构
+- `test`: 测试
+- `chore`: 构建/工具
+
+**示例：**
+```
+feat(rag): add semantic chunking with auto-merging
+fix(auth): resolve login compatibility issue
+docs(readme): add installation guide
+```
+
+### Pull Request 规范
+
+- PR 标题清晰描述变更内容
+- 包含变更说明和测试结果
+- 关联相关 Issue（如有）
+- 至少一位审查者批准
+
+---
+
 ## 常见问题
 
 **Q: 文档列表加载失败，提示 Milvus `closed channel`？**  
@@ -250,6 +312,36 @@ A: 需下载 `BAAI/bge-m3`；可配置 `HF_ENDPOINT` 使用镜像加速（见 [H
 
 ---
 
+## 路线图
+
+- [ ] 支持更多文档格式（PPT、Markdown）
+- [ ] 实现文档版本管理
+- [ ] 添加用户权限细粒度控制
+- [ ] 支持多模型切换
+- [ ] 添加单元测试和集成测试
+- [ ] 优化向量检索性能
+- [ ] 支持私有化部署文档
+
+## 贡献指南
+
+欢迎贡献！请遵循以下步骤：
+
+1. Fork 本仓库
+2. 创建功能分支：`git checkout -b feature/amazing-feature`
+3. 提交更改：`git commit -m 'feat: add amazing feature'`
+4. 推送分支：`git push origin feature/amazing-feature`
+5. 创建 Pull Request
+
+请确保：
+- 代码符合项目规范
+- 添加必要的测试
+- 更新相关文档
+- 提交信息符合 Conventional Commits 规范
+
+---
+
 ## 许可证
 
-本项目仅供学习与研究使用。使用第三方模型与 API 时请遵守相应服务条款。
+本项目采用 [MIT License](LICENSE) 开源许可证。
+
+Copyright (c) 2026 yaox2689-max
