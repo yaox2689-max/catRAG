@@ -12,9 +12,9 @@ from sqlbase import User, ChatSession, ChatMessage
 load_dotenv()
 
 # Token 预算管理常量
-WATERMARK_TOKENS = int(os.getenv("WATERMARK_TOKENS", "22000"))  # 触发摘要的水位线
-MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "25000"))  # 总上下文硬上限
-KEEP_RECENT_MESSAGES = int(os.getenv("KEEP_RECENT_MESSAGES", "10"))  # 摘要时保留最近消息数
+WATERMARK_TOKENS = int(os.getenv("WATERMARK_TOKENS", "12000"))  # 触发摘要的水位线
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "16000"))  # 总上下文硬上限
+KEEP_RECENT_MESSAGES = int(os.getenv("KEEP_RECENT_MESSAGES", "8"))  # 摘要时保留最近消息数
 
 _tiktoken_encoder = None
 
@@ -362,7 +362,7 @@ def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: s
     messages.append(HumanMessage(content=user_payload))
     result = agent.invoke(
         {"messages": messages},
-        config={"recursion_limit": 8},
+        config={"recursion_limit": 25},
     )
 
     response_content = ""
@@ -432,7 +432,7 @@ async def chat_with_agent_stream(user_text: str, user_id: str = "default_user", 
             async for msg, metadata in agent.astream(
                 {"messages": messages},
                 stream_mode="messages",
-                config={"recursion_limit": 8},
+                config={"recursion_limit": 25},
             ):
                 if not isinstance(msg, AIMessageChunk):
                     continue
