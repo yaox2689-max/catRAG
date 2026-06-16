@@ -13,7 +13,7 @@ load_dotenv()
 API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
 BASE_URL = os.getenv("BASE_URL")
-GRADE_MODEL = os.getenv("GRADE_MODEL", "qwen3-max")
+GRADE_MODEL = os.getenv("GRADE_MODEL", "qwen3.7-plus")
 
 _grader_model = None
 _router_model = None
