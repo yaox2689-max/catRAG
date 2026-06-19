@@ -10,6 +10,7 @@ from typing import Dict, List
 
 from semantic_chunker import (
     LEVEL_3_MAX_TOKENS,
+    semantic_split_sentences,
     split_paragraphs,
     split_sentence_to_token_chunks,
     split_sentences,
@@ -19,10 +20,12 @@ from semantic_chunker import (
 class DocumentLoader:
     """文档加载与语义三层分块。"""
 
-    def __init__(self, chunk_size: int = 500, chunk_overlap: int = 50):
+    def __init__(self, chunk_size: int = 500, chunk_overlap: int = 50, embed_fn=None):
         # 保留参数以兼容旧调用；L3 长度由 CHUNK_LEVEL3_MAX_TOKENS 控制
         self._legacy_chunk_size = chunk_size
         self._legacy_chunk_overlap = chunk_overlap
+        # 语义切割用的 embedding 函数，由调用方注入（如 embedding_service.get_embeddings）
+        self._embed_fn = embed_fn
 
     @staticmethod
     def _build_chunk_id(filename: str, page_number: int, level: int, index: int) -> str:
@@ -78,7 +81,7 @@ class DocumentLoader:
             })
             page_global_chunk_idx += 1
 
-            sentences = split_sentences(para_text)
+            sentences = semantic_split_sentences(para_text, embed_fn=self._embed_fn)
             for sent_text in sentences:
                 leaf_parts = split_sentence_to_token_chunks(sent_text, max_tokens=LEVEL_3_MAX_TOKENS)
                 for leaf_text in leaf_parts:

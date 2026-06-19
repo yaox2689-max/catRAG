@@ -37,6 +37,46 @@ def _count_message_tokens(messages: list) -> int:
         total += _count_tokens(content) + 4  # role formatting overhead
     return total
 
+def _truncate_to_token(text: str, max_tokens: int) -> str:
+    """将文本截断到指定 token 数以内。"""
+    encoder = _get_encoder()
+    tokens = encoder.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return encoder.decode(tokens[:max_tokens]) + "..."
+
+
+# 话题切换检测
+_topic_embedder = None
+
+def _get_topic_embedder():
+    global _topic_embedder
+    if _topic_embedder is None:
+        from embedding import EmbeddingService
+        _topic_embedder = EmbeddingService()
+    return _topic_embedder
+
+def _detect_topic_switch(messages: list, current_text: str, threshold: float = 0.5) -> bool:
+    """用 embedding 相似度检测用户是否切换了话题。"""
+    if len(messages) < 2:
+        return False
+    try:
+        embedder = _get_topic_embedder()
+        recent_texts = [m.content for m in messages[-5:] if hasattr(m, "content") and m.content]
+        if not recent_texts:
+            return False
+        recent_vecs = embedder.get_embeddings(recent_texts)
+        current_vec = embedder.get_embeddings([current_text])
+        import numpy as np
+        recent_avg = np.mean(recent_vecs, axis=0)
+        sim = np.dot(current_vec[0], recent_avg) / (
+            np.linalg.norm(current_vec[0]) * np.linalg.norm(recent_avg) + 1e-10
+        )
+        return float(sim) < threshold
+    except Exception:
+        return False
+
+
 def _check_token_watermark(messages: list, model) -> list:
     """检查 token 水位线，超过阈值时触发摘要压缩。返回处理后的消息列表。"""
     total = _count_message_tokens(messages)
@@ -46,16 +86,42 @@ def _check_token_watermark(messages: list, model) -> list:
     if len(messages) <= KEEP_RECENT_MESSAGES:
         return messages
 
-    old_messages = messages[:-KEEP_RECENT_MESSAGES]
-    recent_messages = messages[-KEEP_RECENT_MESSAGES:]
+    # 预算分配：从总上限倒推各部分可用 token
+    system_prompt_reserve = 1000
+    retrieval_reserve = 3000
+    current_input_reserve = 2000
+    available_for_history = MAX_CONTEXT_TOKENS - system_prompt_reserve - retrieval_reserve - current_input_reserve
+
+    # 动态调整保留的最近消息数量，确保不超过预算的 60%
+    recent_budget = int(available_for_history * 0.6)
+    keep_n = KEEP_RECENT_MESSAGES
+    recent_messages = messages[-keep_n:]
+    while _count_message_tokens(recent_messages) > recent_budget and keep_n > 2:
+        keep_n -= 1
+        recent_messages = messages[-keep_n:]
+
+    old_messages = messages[:-keep_n]
     old_tokens = _count_message_tokens(old_messages)
 
     if old_tokens < 500:
         return messages
 
-    summary = summarize_old_messages(model, old_messages)
+    # 摘要预算 = 剩余可用空间
+    summary_budget = available_for_history - _count_message_tokens(recent_messages)
+    summary_budget = max(summary_budget, 800)  # 至少保留 800 token
+
+    summary = summarize_old_messages(model, old_messages, summary_budget)
     summary_msg = SystemMessage(content=f"之前的对话摘要：\n{summary}")
-    return [summary_msg] + recent_messages
+    result = [summary_msg] + recent_messages
+
+    # 二次校验：压缩后仍超限，强制截断摘要
+    if _count_message_tokens(result) > MAX_CONTEXT_TOKENS:
+        forced_budget = MAX_CONTEXT_TOKENS - _count_message_tokens(recent_messages) - 100
+        truncated_summary = _truncate_to_token(summary, max(forced_budget, 500))
+        summary_msg = SystemMessage(content=f"之前的对话摘要：\n{truncated_summary}")
+        result = [summary_msg] + recent_messages
+
+    return result
 
 API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
@@ -301,19 +367,23 @@ def _get_agent_model():
 
 storage = ConversationStorage()
 
-def summarize_old_messages(model, messages: list) -> str:
-    """将旧消息总结为结构化摘要"""
+def summarize_old_messages(model, messages: list, token_budget: int = 3000) -> str:
+    """将旧消息总结为结构化摘要，控制摘要长度并保留关键引用。"""
     old_conversation = "\n".join([
         f"{'用户' if msg.type == 'human' else 'AI'}: {msg.content}"
         for msg in messages
     ])
 
-    summary_prompt = f"""请对以下对话生成结构化摘要，包含以下维度：
+    summary_prompt = f"""请对以下对话生成结构化摘要，严格控制在 {token_budget} token 以内。
+包含以下维度：
 1. 用户身份与背景（如有提及）
 2. 已讨论的法律领域和关键问题
 3. 已解决的问题和关键结论
-4. 未解决的问题或待跟进事项
-5. 用户的偏好和特殊要求
+4. 引用的关键法条原文和检索到的核心内容（如有，保留原文不要改写）
+5. 未解决的问题或待跟进事项
+6. 用户的偏好和特殊要求
+
+要求：用简洁要点式输出，省略过渡语和重复内容。引用的法条和检索原文务必保留。
 
 对话内容：
 {old_conversation}
@@ -321,6 +391,11 @@ def summarize_old_messages(model, messages: list) -> str:
 结构化摘要："""
 
     summary = model.invoke(summary_prompt).content
+
+    # 兜底：模型未遵守长度限制，手动截断
+    if _count_tokens(summary) > token_budget:
+        summary = _truncate_to_token(summary, token_budget)
+
     return summary
 
 
@@ -355,8 +430,17 @@ def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: s
     get_last_rag_context(clear=True)
     reset_tool_call_guards()
 
+    # 检测话题切换
+    topic_switched = _detect_topic_switch(messages, user_text)
+
     # Token 水位线管理：超过阈值时自动摘要压缩
     messages = _check_token_watermark(messages, model)
+
+    # 话题切换时注入隔离提示，避免旧话题污染检索
+    if topic_switched:
+        messages.append(SystemMessage(
+            content="[系统提示] 用户切换了新话题，检索知识库时请仅基于当前问题，不要参考之前的话题。"
+        ))
 
     user_payload = _build_user_payload(user_text, image_context, file_name, file_content_b64)
     messages.append(HumanMessage(content=user_payload))
@@ -417,8 +501,17 @@ async def chat_with_agent_stream(user_text: str, user_id: str = "default_user", 
 
     set_rag_step_queue(_RagStepProxy())
 
+    # 检测话题切换
+    topic_switched = _detect_topic_switch(messages, user_text)
+
     # Token 水位线管理：超过阈值时自动摘要压缩
     messages = _check_token_watermark(messages, model)
+
+    # 话题切换时注入隔离提示
+    if topic_switched:
+        messages.append(SystemMessage(
+            content="[系统提示] 用户切换了新话题，检索知识库时请仅基于当前问题，不要参考之前的话题。"
+        ))
 
     user_payload = _build_user_payload(user_text, image_context, file_name, file_content_b64)
     messages.append(HumanMessage(content=user_payload))

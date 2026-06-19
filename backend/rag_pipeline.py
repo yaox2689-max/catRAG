@@ -14,6 +14,8 @@ API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
 BASE_URL = os.getenv("BASE_URL")
 GRADE_MODEL = os.getenv("GRADE_MODEL", "qwen3.7-plus")
+RERANK_SCORE_THRESHOLD = float(os.getenv("RERANK_SCORE_THRESHOLD", "0.3"))
+GRADE_PASS_RATIO = float(os.getenv("GRADE_PASS_RATIO", "0.4"))
 
 _grader_model = None
 _router_model = None
@@ -58,6 +60,16 @@ GRADE_PROMPT = (
     "If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant. \n"
     "Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question."
     " Output exactly one JSON object with a single key \"binary_score\" whose value is either \"yes\" or \"no\"."
+)
+
+SINGLE_GRADE_PROMPT = (
+    "You are a grader assessing relevance of a retrieved document to a user question.\n"
+    "Here is the retrieved document:\n\n{context}\n\n"
+    "Here is the user question: {question}\n"
+    "If the document contains keyword(s) or semantic meaning related to the user question, "
+    "grade it as relevant.\n"
+    "Give a binary score 'yes' or 'no'.\n"
+    'Output exactly one JSON object: {{"binary_score": "yes"}} or {{"binary_score": "no"}}'
 )
 
 
@@ -164,38 +176,78 @@ def retrieve_initial(state: RAGState) -> RAGState:
     }
 
 
-def grade_documents_node(state: RAGState) -> RAGState:
-    grader = _get_grader_model()
-    emit_rag_step("📊", "正在评估文档相关性...")
+def _grade_docs(
+    docs: List[dict],
+    question: str,
+    rag_trace: dict,
+    grader,
+) -> tuple[str, dict]:
+    """
+    两层评分：Rerank 分数阈值初筛 + 逐条 LLM 评分。
+    返回 (route, updated_rag_trace)。
+    """
+    if not docs:
+        return "rewrite_question", {**rag_trace, "grade_score": "0/0", "grade_method": "empty"}
+
+    # 第一层：Rerank 分数快速筛选
+    has_rerank = rag_trace.get("rerank_applied", False)
+    if has_rerank:
+        high_score = [d for d in docs if (d.get("rerank_score") or 0) >= RERANK_SCORE_THRESHOLD]
+        if not high_score:
+            return "rewrite_question", {
+                **rag_trace,
+                "grade_score": f"0/{len(docs)}",
+                "grade_method": "rerank_threshold",
+            }
+
+    # 第二层：逐条 LLM 评分
     if not grader:
-        grade_update = {
-            "grade_score": "unknown",
-            "grade_route": "rewrite_question",
-            "rewrite_needed": True,
-        }
-        rag_trace = state.get("rag_trace", {}) or {}
-        rag_trace.update(grade_update)
-        return {"route": "rewrite_question", "rag_trace": rag_trace}
+        return "generate_answer", {**rag_trace, "grade_score": "no_grader", "grade_method": "fallback"}
+
+    passed = 0
+    for doc in docs:
+        doc_text = doc.get("text", "")[:1500]  # 截断避免单条过长
+        prompt = SINGLE_GRADE_PROMPT.format(question=question, context=doc_text)
+        try:
+            response = grader.with_structured_output(GradeDocuments).invoke(
+                [{"role": "user", "content": prompt}]
+            )
+            if (response.binary_score or "").strip().lower() == "yes":
+                passed += 1
+        except Exception:
+            pass  # 单条评分失败不影响整体
+
+    ratio = passed / len(docs) if docs else 0
+    route = "generate_answer" if ratio >= GRADE_PASS_RATIO else "rewrite_question"
+    return route, {
+        **rag_trace,
+        "grade_score": f"{passed}/{len(docs)}",
+        "grade_method": "per_doc",
+        "grade_ratio": round(ratio, 2),
+    }
+
+
+def grade_documents_node(state: RAGState) -> RAGState:
+    docs = state.get("docs", [])
     question = state["question"]
-    context = state.get("context", "")
-    prompt = GRADE_PROMPT.format(question=question, context=context)
-    response = grader.with_structured_output(GradeDocuments).invoke(
-        [{"role": "user", "content": prompt}]
-    )
-    score = (response.binary_score or "").strip().lower()
-    route = "generate_answer" if score == "yes" else "rewrite_question"
+    rag_trace = state.get("rag_trace", {}) or {}
+    grader = _get_grader_model()
+
+    emit_rag_step("📊", "正在逐条评估文档相关性...")
+    route, rag_trace = _grade_docs(docs, question, rag_trace, grader)
+
     if route == "generate_answer":
-        emit_rag_step("✅", "文档相关性评估通过", f"评分: {score}")
+        emit_rag_step("✅", "文档相关性评估通过", f"评分: {rag_trace.get('grade_score', '')}")
     else:
-        emit_rag_step("⚠️", "文档相关性不足，将重写查询", f"评分: {score}")
-    grade_update = {
-        "grade_score": score,
+        emit_rag_step("⚠️", "文档相关性不足，将重写查询", f"评分: {rag_trace.get('grade_score', '')}")
+
+    return {
+        "route": route,
+        "rag_trace": rag_trace,
+        "grade_score": rag_trace.get("grade_score", ""),
         "grade_route": route,
         "rewrite_needed": route == "rewrite_question",
     }
-    rag_trace = state.get("rag_trace", {}) or {}
-    rag_trace.update(grade_update)
-    return {"route": route, "rag_trace": rag_trace}
 
 
 def rewrite_question_node(state: RAGState) -> RAGState:
@@ -372,40 +424,27 @@ def retrieve_expanded(state: RAGState) -> RAGState:
 
 def grade_expanded_node(state: RAGState) -> RAGState:
     """对扩展检索结果做二次评估，如果仍不相关且未超过重试上限则回退。"""
-    grader = _get_grader_model()
-    emit_rag_step("📊", "正在评估扩展检索结果...")
-    if not grader:
-        # 无 grader 模型时直接放行
-        rag_trace = state.get("rag_trace", {}) or {}
-        rag_trace.update({"expanded_grade_score": "unknown", "expanded_grade_route": "end"})
-        return {"route": "end", "rag_trace": rag_trace}
-
+    docs = state.get("docs", [])
     question = state["question"]
-    context = state.get("context", "")
-    prompt = GRADE_PROMPT.format(question=question, context=context)
-    response = grader.with_structured_output(GradeDocuments).invoke(
-        [{"role": "user", "content": prompt}]
-    )
-    score = (response.binary_score or "").strip().lower()
-
+    rag_trace = state.get("rag_trace", {}) or {}
+    grader = _get_grader_model()
     retry_count = state.get("retry_count", 0)
 
-    if score == "yes":
+    emit_rag_step("📊", "正在逐条评估扩展检索结果...")
+    grade_result, rag_trace = _grade_docs(docs, question, rag_trace, grader)
+
+    if grade_result == "generate_answer":
         route = "end"
-        emit_rag_step("✅", "扩展检索评估通过", f"评分: {score}")
+        emit_rag_step("✅", "扩展检索评估通过", f"评分: {rag_trace.get('grade_score', '')}")
     elif retry_count >= 1:
-        # 已重试过，不再循环，返回当前结果
         route = "end"
-        emit_rag_step("⚠️", "扩展检索仍不理想，已达重试上限", f"评分: {score}, 重试: {retry_count}")
+        emit_rag_step("⚠️", "扩展检索仍不理想，已达重试上限", f"评分: {rag_trace.get('grade_score', '')}, 重试: {retry_count}")
     else:
         route = "fallback_initial"
-        emit_rag_step("⚠️", "扩展检索结果不相关，回退到原始检索", f"评分: {score}")
+        emit_rag_step("⚠️", "扩展检索结果不相关，回退到原始检索", f"评分: {rag_trace.get('grade_score', '')}")
 
-    rag_trace = state.get("rag_trace", {}) or {}
-    rag_trace.update({
-        "expanded_grade_score": score,
-        "expanded_grade_route": route,
-    })
+    rag_trace["expanded_grade_score"] = rag_trace.pop("grade_score", "")
+    rag_trace["expanded_grade_route"] = route
     return {"route": route, "rag_trace": rag_trace}
 
 

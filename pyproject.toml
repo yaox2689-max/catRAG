@@ -1,7 +1,7 @@
 [project]
 name = "SuperMew"
 version = "0.1.0"
-description = "Add your description here"
+description = "面向法律知识场景的 RAG 智能问答系统，支持混合向量检索、LangGraph 编排、SSE 流式对话"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

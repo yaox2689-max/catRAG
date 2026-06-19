@@ -1,10 +1,13 @@
-"""语义三层分块：页 → 段落 → 句子（超长句子按 token 固定长度切分）。"""
+"""语义三层分块：页 → 段落 → 句子（超长句子按 token 固定长度切分）。
+改进：L3 层支持基于 embedding 相似度的真正语义切割。
+"""
 from __future__ import annotations
 
+import math
 import os
 import re
 from functools import lru_cache
-from typing import List
+from typing import Callable, List, Optional
 
 LEVEL_3_MAX_TOKENS = int(os.getenv("CHUNK_LEVEL3_MAX_TOKENS", "300"))
 LEVEL_3_TOKEN_OVERLAP = int(os.getenv("CHUNK_LEVEL3_TOKEN_OVERLAP", "30"))
@@ -45,6 +48,112 @@ def split_sentences(paragraph_text: str) -> List[str]:
         # 无标点长段落：按逗号次级切分（不按分号，保留法律列举完整性）
         parts = [p.strip() for p in re.split(r"(?<=[，,])\s*", text) if p.strip()]
     return parts if parts else [text]
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """计算两个向量的余弦相似度。"""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a < 1e-10 or norm_b < 1e-10:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _percentile(values: list[float], p: int) -> float:
+    """计算百分位数。"""
+    if not values:
+        return 0.0
+    sorted_v = sorted(values)
+    k = (len(sorted_v) - 1) * p / 100
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_v[int(k)]
+    return sorted_v[f] * (c - k) + sorted_v[c] * (k - f)
+
+
+def semantic_split_sentences(
+    paragraph_text: str,
+    embed_fn: Optional[Callable[[list[str]], list[list[float]]]] = None,
+    threshold_percentile: int = 25,
+    min_chunk_tokens: int = 30,
+) -> List[str]:
+    """
+    在段落内部用 embedding 相似度做语义切割。
+
+    流程：
+    1. 先按句号粗切得到句子列表
+    2. 计算相邻句子的余弦相似度
+    3. 相似度低于动态阈值（下四分位数）处切一刀
+    4. 过短的块向前合并
+    5. 超长块仍走 split_sentence_to_token_chunks 兜底
+
+    如果 embed_fn 为 None 或调用失败，退化为 split_sentences。
+    """
+    if not paragraph_text or not paragraph_text.strip():
+        return []
+
+    # 第一步：按句号粗切
+    raw_sentences = split_sentences(paragraph_text)
+    if len(raw_sentences) <= 1:
+        return raw_sentences
+
+    # 无 embed_fn 时退化为结构切割
+    if embed_fn is None:
+        return raw_sentences
+
+    # 第二步：获取句子 embedding
+    try:
+        embeddings = embed_fn(raw_sentences)
+    except Exception:
+        return raw_sentences
+
+    if not embeddings or len(embeddings) != len(raw_sentences):
+        return raw_sentences
+
+    # 第三步：计算相邻句子相似度
+    similarities = [
+        _cosine_similarity(embeddings[i], embeddings[i + 1])
+        for i in range(len(embeddings) - 1)
+    ]
+
+    # 第四步：动态阈值（下四分位数）
+    threshold = _percentile(similarities, threshold_percentile)
+
+    # 第五步：在相似度低于阈值处切一刀
+    chunks: List[str] = []
+    current_parts: List[str] = [raw_sentences[0]]
+    for i, sim in enumerate(similarities):
+        if sim < threshold:
+            chunks.append("".join(current_parts))
+            current_parts = [raw_sentences[i + 1]]
+        else:
+            current_parts.append(raw_sentences[i + 1])
+    if current_parts:
+        chunks.append("".join(current_parts))
+
+    # 第六步：合并过短块（向前合并）
+    merged: List[str] = []
+    for chunk in chunks:
+        if merged and count_tokens(chunk) < min_chunk_tokens:
+            merged[-1] += chunk
+        else:
+            merged.append(chunk)
+    # 处理最后一个块过短的情况
+    if len(merged) > 1 and count_tokens(merged[-1]) < min_chunk_tokens:
+        merged[-2] += merged[-1]
+        merged.pop()
+
+    # 第七步：超长块兜底（token 切割）
+    result: List[str] = []
+    for chunk in merged:
+        if count_tokens(chunk) > LEVEL_3_MAX_TOKENS:
+            result.extend(split_sentence_to_token_chunks(chunk))
+        else:
+            result.append(chunk)
+
+    return result if result else raw_sentences
 
 
 def split_sentence_to_token_chunks(

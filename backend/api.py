@@ -75,7 +75,7 @@ def _get_document_loader() -> DocumentLoader:
     global _loader
     if _loader is None:
         print("[api] 首次文档处理，正在初始化 DocumentLoader …", flush=True)
-        _loader = DocumentLoader()
+        _loader = DocumentLoader(embed_fn=embedding_service.get_embeddings)
     return _loader
 
 print("[api] 模块加载完成。\n", flush=True)
