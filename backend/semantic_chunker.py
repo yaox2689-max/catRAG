@@ -1,10 +1,13 @@
-"""语义三层分块：页 → 段落 → 句子（超长句子按 token 固定长度切分）。"""
+"""语义三层分块：页 → 段落 → 句子（超长句子按 token 固定长度切分）。
+改进：L3 层支持基于 embedding 相似度的真正语义切割。
+"""
 from __future__ import annotations
 
+import math
 import os
 import re
 from functools import lru_cache
-from typing import List
+from typing import Callable, List, Optional
 
 LEVEL_3_MAX_TOKENS = int(os.getenv("CHUNK_LEVEL3_MAX_TOKENS", "300"))
 LEVEL_3_TOKEN_OVERLAP = int(os.getenv("CHUNK_LEVEL3_TOKEN_OVERLAP", "30"))
@@ -44,6 +47,138 @@ def split_sentences(paragraph_text: str) -> List[str]:
     if len(parts) <= 1 and len(text) > 400:
         # 无标点长段落：按逗号次级切分（不按分号，保留法律列举完整性）
         parts = [p.strip() for p in re.split(r"(?<=[，,])\s*", text) if p.strip()]
+    return parts if parts else [text]
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """计算两个向量的余弦相似度。"""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a < 1e-10 or norm_b < 1e-10:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _percentile(values: list[float], p: int) -> float:
+    """计算百分位数。"""
+    if not values:
+        return 0.0
+    sorted_v = sorted(values)
+    k = (len(sorted_v) - 1) * p / 100
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_v[int(k)]
+    return sorted_v[f] * (c - k) + sorted_v[c] * (k - f)
+
+
+def semantic_split_sentences(
+    paragraph_text: str,
+    embed_fn: Optional[Callable[[list[str]], list[list[float]]]] = None,
+    threshold_percentile: int = 25,
+    min_chunk_tokens: int = 30,
+    max_tokens: int = LEVEL_3_MAX_TOKENS,
+    _depth: int = 0,
+    _max_depth: int = 2,
+) -> List[str]:
+    """
+    在段落内部用 embedding 相似度做语义切割。
+
+    流程：
+    1. 先按句号粗切得到句子列表
+    2. 计算相邻句子的余弦相似度
+    3. 相似度低于动态阈值（下四分位数）处切一刀
+    4. 过短的块向前合并
+    5. 超长块递归语义切割（提高阈值），最终才用 token 切割兜底
+
+    如果 embed_fn 为 None 或调用失败，退化为 split_sentences。
+    """
+    if not paragraph_text or not paragraph_text.strip():
+        return []
+
+    # 第一步：按句号粗切
+    raw_sentences = split_sentences(paragraph_text)
+    if len(raw_sentences) <= 1:
+        # 单句超长且未达递归上限，尝试按逗号再切
+        if _depth < _max_depth and raw_sentences and count_tokens(raw_sentences[0]) > max_tokens:
+            sub = _split_long_sentence_by_comma(raw_sentences[0])
+            if len(sub) > 1:
+                return semantic_split_sentences(
+                    "".join(sub), embed_fn, threshold_percentile, min_chunk_tokens,
+                    max_tokens, _depth + 1, _max_depth,
+                )
+        return raw_sentences
+
+    # 无 embed_fn 时退化为结构切割
+    if embed_fn is None:
+        return raw_sentences
+
+    # 第二步：获取句子 embedding
+    try:
+        embeddings = embed_fn(raw_sentences)
+    except Exception:
+        return raw_sentences
+
+    if not embeddings or len(embeddings) != len(raw_sentences):
+        return raw_sentences
+
+    # 第三步：计算相邻句子相似度
+    similarities = [
+        _cosine_similarity(embeddings[i], embeddings[i + 1])
+        for i in range(len(embeddings) - 1)
+    ]
+
+    # 第四步：动态阈值（递归时提高阈值，切得更细）
+    effective_percentile = min(threshold_percentile + _depth * 25, 75)
+    threshold = _percentile(similarities, effective_percentile)
+
+    # 第五步：在相似度低于阈值处切一刀
+    chunks: List[str] = []
+    current_parts: List[str] = [raw_sentences[0]]
+    for i, sim in enumerate(similarities):
+        if sim < threshold:
+            chunks.append("".join(current_parts))
+            current_parts = [raw_sentences[i + 1]]
+        else:
+            current_parts.append(raw_sentences[i + 1])
+    if current_parts:
+        chunks.append("".join(current_parts))
+
+    # 第六步：合并过短块（向前合并）
+    merged: List[str] = []
+    for chunk in chunks:
+        if merged and count_tokens(chunk) < min_chunk_tokens:
+            merged[-1] += chunk
+        else:
+            merged.append(chunk)
+    if len(merged) > 1 and count_tokens(merged[-1]) < min_chunk_tokens:
+        merged[-2] += merged[-1]
+        merged.pop()
+
+    # 第七步：超长块递归语义切割，最终才用 token 切割兜底
+    result: List[str] = []
+    for chunk in merged:
+        if count_tokens(chunk) > max_tokens:
+            if _depth < _max_depth and embed_fn is not None:
+                # 递归：提高阈值，在更细粒度上找语义断点
+                sub_chunks = semantic_split_sentences(
+                    chunk, embed_fn, threshold_percentile, min_chunk_tokens,
+                    max_tokens, _depth + 1, _max_depth,
+                )
+                result.extend(sub_chunks)
+            else:
+                # 递归上限或无 embed_fn，token 切割兜底
+                result.extend(split_sentence_to_token_chunks(chunk))
+        else:
+            result.append(chunk)
+
+    return result if result else raw_sentences
+
+
+def _split_long_sentence_by_comma(text: str) -> List[str]:
+    """对无句号的长句按逗号切割。"""
+    parts = [p.strip() for p in re.split(r"(?<=[，,；;])\s*", text) if p.strip()]
     return parts if parts else [text]
 
 

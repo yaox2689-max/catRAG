@@ -289,6 +289,50 @@ class MilvusManager:
         
         return formatted_results
 
+    def sparse_retrieve(self, sparse_embedding: dict, top_k: int = 5, filter_expr: str = "") -> list[dict]:
+        """
+        仅使用稀疏向量检索（降级模式，用于消融实验和密集向量不可用时）
+        """
+        from pymilvus import AnnSearchRequest
+
+        output_fields = [
+            "text", "filename", "file_type", "page_number",
+            "chunk_id", "parent_chunk_id", "root_chunk_id", "chunk_level", "chunk_idx",
+        ]
+        sparse_search = AnnSearchRequest(
+            data=[sparse_embedding],
+            anns_field="sparse_embedding",
+            param={"metric_type": "IP", "params": {"drop_ratio_search": 0.2}},
+            limit=top_k,
+            expr=filter_expr,
+        )
+        results = self._run_with_reconnect(
+            lambda client: client.hybrid_search(
+                collection_name=self.collection_name,
+                reqs=[sparse_search],
+                ranker=RRFRanker(k=60),
+                limit=top_k,
+                output_fields=output_fields,
+            )
+        )
+        formatted_results = []
+        for hits in results:
+            for hit in hits:
+                formatted_results.append({
+                    "id": hit.get("id"),
+                    "text": hit.get("text", ""),
+                    "filename": hit.get("filename", ""),
+                    "file_type": hit.get("file_type", ""),
+                    "page_number": hit.get("page_number", 0),
+                    "chunk_id": hit.get("chunk_id", ""),
+                    "parent_chunk_id": hit.get("parent_chunk_id", ""),
+                    "root_chunk_id": hit.get("root_chunk_id", ""),
+                    "chunk_level": hit.get("chunk_level", 0),
+                    "chunk_idx": hit.get("chunk_idx", 0),
+                    "score": hit.get("distance", 0.0),
+                })
+        return formatted_results
+
     def dense_retrieve(self, dense_embedding: list[float], top_k: int = 5, filter_expr: str = "") -> list[dict]:
         """
         仅使用密集向量检索（降级模式，用于稀疏向量不可用时）
